@@ -1,12 +1,15 @@
 {
   "manifest_version": 3,
   "name": "Tumblr Likes Calendar",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Aggiunge alla pagina dei Like di Tumblr un calendario heatmap dei tuoi \u201cmi piace\u201d. Clicca un giorno per saltare ai like di quella data.",
   "browser_specific_settings": {
     "gecko": {
       "id": "tumblr-likes-calendar@local.dev",
-      "strict_min_version": "128.0"
+      "strict_min_version": "128.0",
+      "data_collection_permissions": {
+        "required": ["none"]
+      }
     }
   },
   "icons": {
