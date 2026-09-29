@@ -199,9 +199,12 @@
       cell.style.gridColumn = (col + 1 - firstCol);
       cell.title = `${key} \u2014 ${c} like`;
       if (key <= todayKey) {
+        // Capture THIS day's timestamp now. The loop reuses (and mutates) the
+        // same Date object `d`, so a click handler that read `d` later would
+        // see the loop's final value instead of this cell's day.
+        const endOfDay = new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1, 0, 0, 0);
+        const before = Math.floor(endOfDay.getTime() / 1000);
         cell.addEventListener('click', () => {
-          const endOfDay = new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1, 0, 0, 0);
-          const before = Math.floor(endOfDay.getTime() / 1000);
           window.location.assign('/likes?before=' + before);
         });
       } else {
