@@ -21,8 +21,8 @@
   const CACHE_KEY = 'tlc:cache:v1';
   const PAGE_LIMIT = 50;          // likes per API page (Tumblr max for this endpoint)
   const PAGE_SLEEP_MS = 180;      // gentle pause between pages
-  const DOW = ['Dom', 'Lun', 'Mar', 'Mer', 'Gio', 'Ven', 'Sab'];
-  const MONTHS = ['Gen', 'Feb', 'Mar', 'Apr', 'Mag', 'Giu', 'Lug', 'Ago', 'Set', 'Ott', 'Nov', 'Dic'];
+  const DOW = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const pad = (n) => String(n).padStart(2, '0');
@@ -197,7 +197,7 @@
       cell.className = 'tlc-cell l' + levelFor(c, maxDaily);
       cell.style.gridRow = (weekday + 1);
       cell.style.gridColumn = (col + 1 - firstCol);
-      cell.title = `${key} \u2014 ${c} like`;
+      cell.title = `${key} \u2014 ${c} likes`;
       if (key <= todayKey) {
         // Capture THIS day's timestamp now. The loop reuses (and mutates) the
         // same Date object `d`, so a click handler that read `d` later would
@@ -236,7 +236,7 @@
     if (!data || !data.total) {
       const e = document.createElement('div');
       e.className = 'tlc-empty';
-      e.textContent = 'Nessun like trovato (o non ancora caricati). Premi \u201cAggiorna\u201d.';
+      e.textContent = 'No likes found (or not loaded yet). Press \u201cRefresh\u201d.';
       container.appendChild(e);
       return;
     }
@@ -254,13 +254,13 @@
 
     const legend = document.createElement('div');
     legend.className = 'tlc-legend';
-    legend.appendChild(document.createTextNode('Meno'));
+    legend.appendChild(document.createTextNode('Less'));
     for (let l = 0; l <= 4; l++) {
       const c = document.createElement('div');
       c.className = 'tlc-cell l' + l;
       legend.appendChild(c);
     }
-    legend.appendChild(document.createTextNode('Pi\u00f9'));
+    legend.appendChild(document.createTextNode('More'));
     container.appendChild(legend);
   }
 
@@ -280,16 +280,16 @@
     const head = document.createElement('div');
     head.className = 'tlc-head';
     const h2 = document.createElement('h2');
-    h2.textContent = 'Calendario dei tuoi like';
+    h2.textContent = 'Your likes calendar';
     const spacer = document.createElement('div');
     spacer.className = 'tlc-spacer';
     refreshBtn = document.createElement('button');
     refreshBtn.className = 'tlc-btn';
-    refreshBtn.textContent = 'Aggiorna';
+    refreshBtn.textContent = 'Refresh';
     refreshBtn.addEventListener('click', runFetch);
     const closeBtn = document.createElement('button');
     closeBtn.className = 'tlc-btn';
-    closeBtn.textContent = 'Chiudi';
+    closeBtn.textContent = 'Close';
     closeBtn.addEventListener('click', closePanel);
     head.append(h2, spacer, refreshBtn, closeBtn);
 
@@ -312,15 +312,15 @@
       subEl.textContent = describeCache(cache);
       renderCalendar(calBox, cache);
     } else {
-      subEl.textContent = 'Primo avvio: premi \u201cAggiorna\u201d per scaricare i tuoi like.';
+      subEl.textContent = 'First run: press \u201cRefresh\u201d to download your likes.';
       renderCalendar(calBox, null);
     }
   }
   function closePanel() { if (overlay) overlay.classList.remove('tlc-open'); }
 
   function describeCache(cache) {
-    const when = new Date(cache.cachedAt).toLocaleString('it-IT');
-    return `${cache.total} like totali \u00b7 dati aggiornati al ${when} \u00b7 clicca un giorno per aprire i like di quella data`;
+    const when = new Date(cache.cachedAt).toLocaleString('en-US');
+    return `${cache.total} likes total \u00b7 updated ${when} \u00b7 click a day to open the likes from that date`;
   }
 
   async function runFetch() {
@@ -328,25 +328,25 @@
     calBox.innerHTML = '';
     const prog = document.createElement('div');
     prog.className = 'tlc-progress';
-    prog.textContent = 'Attendo l\u2019API di Tumblr\u2026';
+    prog.textContent = 'Waiting for the Tumblr API\u2026';
     calBox.appendChild(prog);
 
     const ok = await waitForApi();
     if (!ok) {
       prog.className = 'tlc-err';
-      prog.textContent = 'window.tumblr.apiFetch non disponibile. Assicurati di essere loggato su Tumblr e ricarica la pagina.';
+      prog.textContent = 'window.tumblr.apiFetch is not available. Make sure you are logged in to Tumblr and reload the page.';
       refreshBtn.disabled = false;
       return;
     }
 
     try {
-      const data = await gatherLikes((n) => { prog.textContent = `Trovati ${n} like\u2026`; });
+      const data = await gatherLikes((n) => { prog.textContent = `Found ${n} likes\u2026`; });
       saveCache(data);
       subEl.textContent = describeCache(data);
       renderCalendar(calBox, data);
     } catch (err) {
       prog.className = 'tlc-err';
-      prog.textContent = 'Errore durante il recupero dei like:\n' + (err && err.message ? err.message : String(err));
+      prog.textContent = 'Error while fetching likes:\n' + (err && err.message ? err.message : String(err));
     } finally {
       refreshBtn.disabled = false;
     }
@@ -362,7 +362,7 @@
       if (!launcher) {
         launcher = document.createElement('button');
         launcher.id = 'tlc-launcher';
-        launcher.textContent = '\uD83D\uDCC5 Calendario like';
+        launcher.textContent = '\uD83D\uDCC5 Likes calendar';
         launcher.addEventListener('click', openPanel);
         document.body.appendChild(launcher);
       }
