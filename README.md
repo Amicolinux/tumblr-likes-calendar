@@ -1,10 +1,21 @@
 Tumblr Likes Calendar
 
+
 Firefox extension that adds a heatmap calendar of your "likes" to the Tumblr Likes page (tumblr.com/likes): each day is shaded based on how many posts you liked, and clicking a day jumps you straight to the likes from that date.
 
 Tumblr's likes can't be searched or filtered, so finding an image you saved months ago means scrolling endlessly. This extension turns your likes into something you can actually navigate by date.
 
 ![Tumblr Likes Calendar screenshot](amo-screenshot-en.png)
+
+<p align="center">
+  <a href="https://chromewebstore.google.com/detail/tumblr-likes-calendar/dhpphdeacendokgoaceccnghjjeineld">
+    <img src="https://img.shields.io/badge/Install_for_Chrome-4285F4?style=for-the-badge&logo=googlechrome&logoColor=white" alt="Install for Chrome" height="48">
+  </a>
+  &nbsp;&nbsp;
+  <a href="https://addons.mozilla.org/firefox/addon/tumblr-likes-calendar/">
+    <img src="https://img.shields.io/badge/Install_for_Firefox-FF7139?style=for-the-badge&logo=firefoxbrowser&logoColor=white" alt="Install for Firefox" height="48">
+  </a>
+</p>
 
 📦 Available on Firefox Add-ons: https://addons.mozilla.org/firefox/addon/tumblr-likes-calendar/
 
