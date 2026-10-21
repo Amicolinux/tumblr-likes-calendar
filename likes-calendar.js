@@ -1,16 +1,29 @@
 /*
- * Tumblr Likes Calendar
- * ---------------------
+ * Tumblr Likes Calendar  —  v0.2.0
+ * --------------------------------
  * Runs in the MAIN world (page context) so it can use window.tumblr.apiFetch,
  * the authenticated fetch helper Tumblr exposes to extensions. No API key,
  * no OAuth: it piggybacks on your logged-in session.
  *
  * Data flow:
- *   /v2/user/likes  ->  response.likedPosts[].likedTimestamp (Unix seconds)
+ *   /v2/user/likes  ->  response.likedPosts[]  (full post objects)
  *   follow response.links.next.href until it runs out.
- * We bucket those timestamps per day and draw a GitHub-style heatmap.
- * Clicking a day navigates to /likes?before=<end-of-that-day> so the list
- * opens at that date.
+ *
+ * What's new in 0.2.0:
+ *   - Storage moved from localStorage to IndexedDB. We now keep, per liked
+ *     post, its tags, image URLs, blog, permalink and summary — not just a
+ *     per-day count. This is what makes tag search possible and lets future
+ *     versions show thumbnails without another full re-scan.
+ *   - Tag search: type a tag (or click one of your most-used tags) to list
+ *     every like carrying it, newest first, each linking back to the post.
+ *
+ * The heatmap calendar itself works exactly as before: click a day to open
+ * /likes?before=<end-of-that-day>.
+ *
+ * NOTE ON UPGRADING FROM 0.1.x: the old localStorage cache only held per-day
+ * counts, with no tags. On first run of 0.2.0 the calendar still shows from
+ * that old cache, but a one-time full "Refresh" is needed to populate tags
+ * and images for search.
  */
 (function () {
   'use strict';
@@ -18,15 +31,192 @@
   if (window.__tumblrLikesCalendarLoaded) return;
   window.__tumblrLikesCalendarLoaded = true;
 
-  const CACHE_KEY = 'tlc:cache:v1';
+  const LEGACY_CACHE_KEY = 'tlc:cache:v1';  // v0.1.x localStorage key (per-day counts only)
+  const DB_NAME = 'TumblrLikesCalendar';
+  const DB_VERSION = 1;
+  const STORE_POSTS = 'posts';
+  const STORE_META = 'meta';
+  const META_ID = 'summary';
   const PAGE_LIMIT = 50;          // likes per API page (Tumblr max for this endpoint)
   const PAGE_SLEEP_MS = 180;      // gentle pause between pages
+  const TOP_TAGS_KEEP = 40;       // how many "most used" tags to remember for the chip cloud
+  const SEARCH_RESULT_LIMIT = 300;// cap rendered search results (for DOM sanity)
   const DOW = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
   const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const pad = (n) => String(n).padStart(2, '0');
   const dayKey = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  const normTag = (t) => String(t == null ? '' : t).trim().toLowerCase();
+
+  // ---- IndexedDB layer ----------------------------------------------------
+  let _dbPromise = null;
+  function openDB() {
+    if (_dbPromise) return _dbPromise;
+    _dbPromise = new Promise((resolve, reject) => {
+      const req = indexedDB.open(DB_NAME, DB_VERSION);
+      req.onupgradeneeded = (e) => {
+        const db = req.result;
+        if (!db.objectStoreNames.contains(STORE_POSTS)) {
+          const s = db.createObjectStore(STORE_POSTS, { keyPath: 'key' });
+          s.createIndex('tags', 'tags', { multiEntry: true });
+          s.createIndex('ts', 'ts', { unique: false });
+          s.createIndex('blog', 'blog', { unique: false });
+        }
+        if (!db.objectStoreNames.contains(STORE_META)) {
+          db.createObjectStore(STORE_META, { keyPath: 'id' });
+        }
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+    return _dbPromise;
+  }
+
+  function txDone(tx) {
+    return new Promise((resolve, reject) => {
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error);
+    });
+  }
+  function reqDone(req) {
+    return new Promise((resolve, reject) => {
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  async function getMeta() {
+    const db = await openDB();
+    const tx = db.transaction(STORE_META, 'readonly');
+    const res = await reqDone(tx.objectStore(STORE_META).get(META_ID));
+    return res || null;
+  }
+
+  // Replace the whole dataset in one go: clear posts, write all records, store meta.
+  async function writeAll(records, meta) {
+    const db = await openDB();
+    const tx = db.transaction([STORE_POSTS, STORE_META], 'readwrite');
+    const posts = tx.objectStore(STORE_POSTS);
+    const metaStore = tx.objectStore(STORE_META);
+    posts.clear();
+    for (const r of records) posts.put(r);
+    metaStore.put(meta);
+    await txDone(tx);
+  }
+
+  // Exact-tag lookup via the multiEntry index; returns records sorted newest-first.
+  async function postsByTag(tag) {
+    const key = normTag(tag);
+    if (!key) return [];
+    const db = await openDB();
+    const tx = db.transaction(STORE_POSTS, 'readonly');
+    const idx = tx.objectStore(STORE_POSTS).index('tags');
+    const out = await reqDone(idx.getAll(IDBKeyRange.only(key)));
+    out.sort((a, b) => (b.ts || 0) - (a.ts || 0));
+    return out;
+  }
+
+  // Build the full distinct-tag list (cached) so we can offer "contains" suggestions.
+  let _distinctTags = null;
+  async function distinctTags() {
+    if (_distinctTags) return _distinctTags;
+    const db = await openDB();
+    const tx = db.transaction(STORE_POSTS, 'readonly');
+    const idx = tx.objectStore(STORE_POSTS).index('tags');
+    const set = new Set();
+    await new Promise((resolve, reject) => {
+      const cur = idx.openKeyCursor();
+      cur.onsuccess = () => {
+        const c = cur.result;
+        if (!c) { resolve(); return; }
+        set.add(c.key);
+        c.continue();
+      };
+      cur.onerror = () => reject(cur.error);
+    });
+    _distinctTags = Array.from(set).sort();
+    return _distinctTags;
+  }
+
+  // ---- post parsing -------------------------------------------------------
+  function pickImageFromMedia(media) {
+    if (!Array.isArray(media) || !media.length) return null;
+    // Prefer the widest variant; fall back to the first with a url.
+    let best = null;
+    for (const m of media) {
+      if (!m || !m.url) continue;
+      if (!best || (m.width || 0) > (best.width || 0)) best = m;
+    }
+    return best ? best.url : null;
+  }
+
+  function collectFromBlocks(blocks, urls) {
+    if (!Array.isArray(blocks)) return;
+    for (const b of blocks) {
+      if (b && b.type === 'image') {
+        const u = pickImageFromMedia(b.media);
+        if (u) urls.add(u);
+      }
+    }
+  }
+
+  function extractImages(post) {
+    const urls = new Set();
+    // Legacy photo posts
+    const photos = post.photos || post.photoset || null;
+    if (Array.isArray(photos)) {
+      for (const ph of photos) {
+        if (!ph) continue;
+        const os = ph.originalSize || ph.original_size;
+        if (os && os.url) urls.add(os.url);
+        else if (ph.url) urls.add(ph.url);
+      }
+    }
+    // NPF content on the post itself
+    collectFromBlocks(post.content, urls);
+    // NPF content in the reblog trail
+    if (Array.isArray(post.trail)) {
+      for (const t of post.trail) if (t) collectFromBlocks(t.content, urls);
+    }
+    return Array.from(urls);
+  }
+
+  function extractTags(post) {
+    const raw = Array.isArray(post.tags) ? post.tags : [];
+    const seen = new Set();
+    const norm = [];
+    const display = [];
+    for (const t of raw) {
+      const n = normTag(t);
+      if (!n || seen.has(n)) continue;
+      seen.add(n);
+      norm.push(n);
+      display.push(String(t).trim());
+    }
+    return { norm, display };
+  }
+
+  function toRecord(post) {
+    const ts = post.likedTimestamp ?? post.liked_timestamp;
+    if (!ts) return null;
+    const blog = post.blogName || post.blog_name || (post.blog && post.blog.name) || 'unknown';
+    const id = post.id != null ? String(post.id)
+             : (post.idString || post.id_string || '');
+    const { norm, display } = extractTags(post);
+    return {
+      key: `${blog}:${id}`,
+      blog,
+      id,
+      ts,
+      tags: norm,                 // indexed (multiEntry)
+      tagsRaw: display,           // for showing nicely
+      images: extractImages(post),
+      postUrl: post.postUrl || post.post_url || `https://${blog}.tumblr.com/post/${id}`,
+      summary: (post.summary || '').slice(0, 200),
+    };
+  }
 
   // ---- styles -------------------------------------------------------------
   function injectStyles() {
@@ -59,7 +249,51 @@
       }
       .tlc-btn:hover { background: #273240; }
       .tlc-btn[disabled] { opacity: .5; cursor: default; }
-      .tlc-sub { color: #9fb0c3; margin: 2px 0 16px; }
+      .tlc-sub { color: #9fb0c3; margin: 2px 0 14px; }
+
+      /* search bar */
+      .tlc-search { display: flex; gap: 8px; align-items: center; margin: 2px 0 10px; }
+      .tlc-search input {
+        flex: 1; background: #0d1319; color: #e8ecf1; border: 1px solid #ffffff26;
+        border-radius: 8px; padding: 8px 11px; font: 14px system-ui, sans-serif;
+      }
+      .tlc-search input::placeholder { color: #6b7e92; }
+      .tlc-chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 14px; }
+      .tlc-chip {
+        background: #182230; color: #bcd; border: 1px solid #ffffff1f; border-radius: 999px;
+        padding: 3px 10px; font-size: 12px; cursor: pointer; white-space: nowrap;
+      }
+      .tlc-chip:hover { background: #22303f; color: #fff; }
+      .tlc-chip .tlc-chip-n { color: #6f8197; margin-left: 5px; }
+      .tlc-chips-label { color: #8ea0b5; font-size: 12px; margin: 0 0 6px; }
+
+      /* search results */
+      .tlc-results { margin-top: 4px; }
+      .tlc-result {
+        display: flex; gap: 12px; align-items: flex-start; padding: 10px 0;
+        border-top: 1px solid #ffffff14;
+      }
+      .tlc-thumb {
+        width: 72px; height: 72px; border-radius: 8px; object-fit: cover;
+        background: #0d1319; flex: none; border: 1px solid #ffffff14;
+      }
+      .tlc-thumb.tlc-noimg { display: flex; align-items: center; justify-content: center;
+        color: #4d6074; font-size: 22px; }
+      .tlc-rmeta { min-width: 0; flex: 1; }
+      .tlc-rtop { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+      .tlc-rblog { font-weight: 700; color: #e8ecf1; }
+      .tlc-rdate { color: #8ea0b5; font-size: 12px; }
+      .tlc-ropen { margin-left: auto; }
+      .tlc-rsummary { color: #c3cedb; margin: 3px 0 5px; overflow: hidden;
+        display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+      .tlc-rtags { display: flex; flex-wrap: wrap; gap: 5px; }
+      .tlc-rtag { color: #7fb2ff; font-size: 12px; cursor: pointer; }
+      .tlc-rtag:hover { text-decoration: underline; }
+      .tlc-back { color: #7fb2ff; cursor: pointer; font-size: 13px; }
+      .tlc-back:hover { text-decoration: underline; }
+      .tlc-suggest { color: #9fb0c3; font-size: 13px; margin: 6px 0 2px; }
+
+      /* calendar (unchanged) */
       .tlc-year { margin: 22px 0 6px; font-weight: 700; color: #cbd6e2; }
       .tlc-grid-wrap { overflow-x: auto; padding-bottom: 6px; }
       .tlc-months { display: grid; grid-auto-flow: column; grid-auto-columns: 13px;
@@ -99,48 +333,75 @@
     return false;
   }
 
-  async function gatherLikes(onProgress) {
+  // Full scan: walks every like, builds per-post records + per-day counts +
+  // a top-tags tally, then stores it all in IndexedDB.
+  async function scanLikes(onProgress) {
+    const records = [];
     const counts = Object.create(null);
-    let total = 0;
-    let minTs = Infinity;
-    let maxTs = -Infinity;
+    const tagFreq = Object.create(null);
+    let total = 0, kept = 0, withImages = 0;
+    let minTs = Infinity, maxTs = -Infinity;
     let resource = `/v2/user/likes?limit=${PAGE_LIMIT}`;
 
     while (resource) {
       const { response } = await window.tumblr.apiFetch(resource);
       const posts = (response && response.likedPosts) || [];
       for (const p of posts) {
-        const ts = p.likedTimestamp ?? p.liked_timestamp;
-        if (!ts) continue;
-        const d = new Date(ts * 1000);
+        const rec = toRecord(p);
+        if (!rec) continue;
+        total += 1;
+        kept += 1;
+        if (rec.images.length) withImages += 1;
+        const d = new Date(rec.ts * 1000);
         const key = dayKey(d);
         counts[key] = (counts[key] || 0) + 1;
-        total += 1;
-        if (ts < minTs) minTs = ts;
-        if (ts > maxTs) maxTs = ts;
+        if (rec.ts < minTs) minTs = rec.ts;
+        if (rec.ts > maxTs) maxTs = rec.ts;
+        for (const t of rec.tags) tagFreq[t] = (tagFreq[t] || 0) + 1;
+        records.push(rec);
       }
       if (onProgress) onProgress(total);
       resource = response && response.links && response.links.next && response.links.next.href;
       if (resource) await sleep(PAGE_SLEEP_MS);
     }
 
-    return {
+    const topTags = Object.keys(tagFreq)
+      .sort((a, b) => tagFreq[b] - tagFreq[a])
+      .slice(0, TOP_TAGS_KEEP)
+      .map((t) => ({ tag: t, n: tagFreq[t] }));
+
+    const meta = {
+      id: META_ID,
+      total: kept,
+      withImages,
+      distinctTags: Object.keys(tagFreq).length,
       counts,
-      total,
+      topTags,
       minTs: isFinite(minTs) ? minTs : null,
       maxTs: isFinite(maxTs) ? maxTs : null,
       cachedAt: Date.now(),
     };
+
+    _distinctTags = null; // invalidate cached tag list
+    await writeAll(records, meta);
+    return meta;
   }
 
-  function loadCache() {
-    try { return JSON.parse(localStorage.getItem(CACHE_KEY)); } catch { return null; }
+  // ---- legacy localStorage (for first-run display before a rescan) --------
+  function loadLegacyCache() {
+    try {
+      const raw = localStorage.getItem(LEGACY_CACHE_KEY);
+      if (!raw) return null;
+      const c = JSON.parse(raw);
+      if (!c || !c.counts) return null;
+      return c; // {counts, total, minTs, maxTs, cachedAt}
+    } catch { return null; }
   }
-  function saveCache(data) {
-    try { localStorage.setItem(CACHE_KEY, JSON.stringify(data)); } catch { /* ignore quota */ }
+  function clearLegacyCache() {
+    try { localStorage.removeItem(LEGACY_CACHE_KEY); } catch { /* ignore */ }
   }
 
-  // ---- rendering ----------------------------------------------------------
+  // ---- calendar rendering (unchanged behaviour) ---------------------------
   function levelFor(count, max) {
     if (!count) return 0;
     if (max <= 1) return 4;
@@ -162,7 +423,6 @@
     const scroll = document.createElement('div');
     scroll.className = 'tlc-grid-wrap';
 
-    // month labels
     const months = document.createElement('div');
     months.className = 'tlc-months';
 
@@ -171,7 +431,6 @@
 
     const dows = document.createElement('div');
     dows.className = 'tlc-dows';
-    // show Mon/Wed/Fri to reduce clutter
     for (let i = 0; i < 7; i++) {
       const s = document.createElement('span');
       s.textContent = (i === 1 || i === 3 || i === 5) ? DOW[i] : '';
@@ -187,7 +446,7 @@
     let lastMonthLabeled = -1;
 
     for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
-      const weekday = d.getDay();               // 0..6 (Sun..Sat)
+      const weekday = d.getDay();
       const dayOfYear = Math.floor((d - start) / 86400000);
       const col = Math.floor((dayOfYear + start.getDay()) / 7);
 
@@ -197,11 +456,8 @@
       cell.className = 'tlc-cell l' + levelFor(c, maxDaily);
       cell.style.gridRow = (weekday + 1);
       cell.style.gridColumn = (col + 1 - firstCol);
-      cell.title = `${key} \u2014 ${c} likes`;
+      cell.title = `${key} — ${c} likes`;
       if (key <= todayKey) {
-        // Capture THIS day's timestamp now. The loop reuses (and mutates) the
-        // same Date object `d`, so a click handler that read `d` later would
-        // see the loop's final value instead of this cell's day.
         const endOfDay = new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1, 0, 0, 0);
         const before = Math.floor(endOfDay.getTime() / 1000);
         cell.addEventListener('click', () => {
@@ -212,7 +468,6 @@
       }
       grid.appendChild(cell);
 
-      // month label at the first day of each month
       if (d.getDate() === 1 && d.getMonth() !== lastMonthLabeled) {
         lastMonthLabeled = d.getMonth();
         const m = document.createElement('div');
@@ -233,10 +488,10 @@
   function renderCalendar(container, data) {
     container.innerHTML = '';
 
-    if (!data || !data.total) {
+    if (!data || !data.total || !data.counts) {
       const e = document.createElement('div');
       e.className = 'tlc-empty';
-      e.textContent = 'No likes found (or not loaded yet). Press \u201cRefresh\u201d.';
+      e.textContent = 'No likes found (or not loaded yet). Press “Refresh”.';
       container.appendChild(e);
       return;
     }
@@ -264,8 +519,190 @@
     container.appendChild(legend);
   }
 
+  // ---- search rendering ---------------------------------------------------
+  function fmtDate(ts) {
+    try { return new Date(ts * 1000).toLocaleDateString('en-US',
+      { year: 'numeric', month: 'short', day: 'numeric' }); }
+    catch { return ''; }
+  }
+
+  function renderResult(rec) {
+    const row = document.createElement('div');
+    row.className = 'tlc-result';
+
+    if (rec.images && rec.images.length) {
+      const img = document.createElement('img');
+      img.className = 'tlc-thumb';
+      img.loading = 'lazy';
+      img.src = rec.images[0];
+      img.alt = '';
+      img.addEventListener('error', () => {
+        const ph = document.createElement('div');
+        ph.className = 'tlc-thumb tlc-noimg';
+        ph.textContent = '\u{1F5BC}';
+        img.replaceWith(ph);
+      });
+      row.appendChild(img);
+    } else {
+      const ph = document.createElement('div');
+      ph.className = 'tlc-thumb tlc-noimg';
+      ph.textContent = '\u{1F4C4}';
+      row.appendChild(ph);
+    }
+
+    const meta = document.createElement('div');
+    meta.className = 'tlc-rmeta';
+
+    const top = document.createElement('div');
+    top.className = 'tlc-rtop';
+    const blog = document.createElement('span');
+    blog.className = 'tlc-rblog';
+    blog.textContent = rec.blog;
+    const date = document.createElement('span');
+    date.className = 'tlc-rdate';
+    date.textContent = fmtDate(rec.ts);
+    const open = document.createElement('a');
+    open.className = 'tlc-btn tlc-ropen';
+    open.textContent = 'Open';
+    open.href = rec.postUrl;
+    open.target = '_blank';
+    open.rel = 'noopener';
+    top.append(blog, date, open);
+    meta.appendChild(top);
+
+    if (rec.summary) {
+      const sum = document.createElement('div');
+      sum.className = 'tlc-rsummary';
+      sum.textContent = rec.summary;
+      meta.appendChild(sum);
+    }
+
+    const tagsWrap = document.createElement('div');
+    tagsWrap.className = 'tlc-rtags';
+    const show = (rec.tagsRaw && rec.tagsRaw.length) ? rec.tagsRaw : rec.tags;
+    show.slice(0, 12).forEach((t, i) => {
+      const el = document.createElement('span');
+      el.className = 'tlc-rtag';
+      el.textContent = '#' + t;
+      el.addEventListener('click', () => doSearch(rec.tags[i] || t));
+      tagsWrap.appendChild(el);
+    });
+    meta.appendChild(tagsWrap);
+
+    row.appendChild(meta);
+    return row;
+  }
+
+  async function doSearch(tag) {
+    const q = normTag(tag);
+    searchInput.value = tag;
+    showingSearch = true;
+    calBox.style.display = 'none';
+    chipsBox.style.display = 'none';
+    resultsBox.style.display = 'block';
+    resultsBox.innerHTML = '';
+
+    const bar = document.createElement('div');
+    bar.className = 'tlc-search';
+    const back = document.createElement('span');
+    back.className = 'tlc-back';
+    back.textContent = '← Back to calendar';
+    back.addEventListener('click', showCalendar);
+    bar.appendChild(back);
+    resultsBox.appendChild(bar);
+
+    if (!q) { showCalendar(); return; }
+
+    const header = document.createElement('div');
+    header.className = 'tlc-sub';
+    resultsBox.appendChild(header);
+
+    let matches = [];
+    try {
+      matches = await postsByTag(q);
+    } catch (err) {
+      header.className = 'tlc-err';
+      header.textContent = 'Search error: ' + (err && err.message ? err.message : String(err));
+      return;
+    }
+
+    header.textContent = matches.length
+      ? `${matches.length} like${matches.length === 1 ? '' : 's'} tagged “${q}”`
+      : `No likes tagged “${q}”`;
+
+    // If nothing exact, offer "tags containing" suggestions.
+    if (!matches.length) {
+      try {
+        const all = await distinctTags();
+        const near = all.filter((t) => t.includes(q)).slice(0, 30);
+        if (near.length) {
+          const sug = document.createElement('div');
+          sug.className = 'tlc-suggest';
+          sug.textContent = 'Tags containing “' + q + '”:';
+          resultsBox.appendChild(sug);
+          const chips = document.createElement('div');
+          chips.className = 'tlc-chips';
+          near.forEach((t) => chips.appendChild(makeChip(t)));
+          resultsBox.appendChild(chips);
+        }
+      } catch { /* ignore */ }
+      return;
+    }
+
+    const list = document.createElement('div');
+    list.className = 'tlc-results';
+    const shown = matches.slice(0, SEARCH_RESULT_LIMIT);
+    for (const rec of shown) list.appendChild(renderResult(rec));
+    resultsBox.appendChild(list);
+
+    if (matches.length > shown.length) {
+      const more = document.createElement('div');
+      more.className = 'tlc-sub';
+      more.style.marginTop = '12px';
+      more.textContent = `Showing the first ${shown.length} of ${matches.length}.`;
+      resultsBox.appendChild(more);
+    }
+  }
+
+  function makeChip(tag, n) {
+    const chip = document.createElement('span');
+    chip.className = 'tlc-chip';
+    chip.textContent = '#' + tag;
+    if (n != null) {
+      const cnt = document.createElement('span');
+      cnt.className = 'tlc-chip-n';
+      cnt.textContent = n;
+      chip.appendChild(cnt);
+    }
+    chip.addEventListener('click', () => doSearch(tag));
+    return chip;
+  }
+
+  function renderTopTags(meta) {
+    chipsBox.innerHTML = '';
+    if (!meta || !meta.topTags || !meta.topTags.length) return;
+    const label = document.createElement('div');
+    label.className = 'tlc-chips-label';
+    label.textContent = 'Your most-used tags:';
+    chipsBox.appendChild(label);
+    const cloud = document.createElement('div');
+    cloud.className = 'tlc-chips';
+    for (const { tag, n } of meta.topTags) cloud.appendChild(makeChip(tag, n));
+    chipsBox.appendChild(cloud);
+  }
+
+  function showCalendar() {
+    showingSearch = false;
+    resultsBox.style.display = 'none';
+    resultsBox.innerHTML = '';
+    calBox.style.display = 'block';
+    chipsBox.style.display = 'block';
+  }
+
   // ---- panel / UI ---------------------------------------------------------
-  let overlay, calBox, subEl, refreshBtn;
+  let overlay, calBox, chipsBox, resultsBox, subEl, refreshBtn, searchInput;
+  let showingSearch = false;
+  let currentMeta = null;
 
   function buildPanel() {
     injectStyles();
@@ -297,38 +734,77 @@
     subEl.className = 'tlc-sub';
     subEl.textContent = '';
 
+    // search bar
+    const search = document.createElement('div');
+    search.className = 'tlc-search';
+    searchInput = document.createElement('input');
+    searchInput.type = 'search';
+    searchInput.placeholder = 'Search your likes by tag…';
+    searchInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); doSearch(searchInput.value); }
+    });
+    const searchBtn = document.createElement('button');
+    searchBtn.className = 'tlc-btn';
+    searchBtn.textContent = 'Search';
+    searchBtn.addEventListener('click', () => doSearch(searchInput.value));
+    search.append(searchInput, searchBtn);
+
+    chipsBox = document.createElement('div');
+    resultsBox = document.createElement('div');
+    resultsBox.style.display = 'none';
     calBox = document.createElement('div');
 
-    panel.append(head, subEl, calBox);
+    panel.append(head, subEl, search, chipsBox, resultsBox, calBox);
     overlay.appendChild(panel);
     document.body.appendChild(overlay);
   }
 
-  function openPanel() {
+  async function openPanel() {
     if (!overlay) buildPanel();
     overlay.classList.add('tlc-open');
-    const cache = loadCache();
-    if (cache) {
-      subEl.textContent = describeCache(cache);
-      renderCalendar(calBox, cache);
+    showCalendar();
+
+    let meta = null;
+    try { meta = await getMeta(); } catch { /* ignore */ }
+    currentMeta = meta;
+
+    if (meta && meta.total) {
+      subEl.textContent = describeMeta(meta);
+      renderTopTags(meta);
+      renderCalendar(calBox, meta);
+      return;
+    }
+
+    // No IndexedDB data yet. Fall back to the old localStorage counts so the
+    // calendar isn't empty right after upgrading, and nudge a rescan.
+    const legacy = loadLegacyCache();
+    if (legacy && legacy.total) {
+      subEl.textContent = 'Upgraded to 0.2.0 — press “Refresh” once to enable tag search '
+        + '(your old calendar is shown below in the meantime).';
+      renderTopTags(null);
+      renderCalendar(calBox, legacy);
     } else {
-      subEl.textContent = 'First run: press \u201cRefresh\u201d to download your likes.';
+      subEl.textContent = 'First run: press “Refresh” to download your likes.';
+      renderTopTags(null);
       renderCalendar(calBox, null);
     }
   }
   function closePanel() { if (overlay) overlay.classList.remove('tlc-open'); }
 
-  function describeCache(cache) {
-    const when = new Date(cache.cachedAt).toLocaleString('en-US');
-    return `${cache.total} likes total \u00b7 updated ${when} \u00b7 click a day to open the likes from that date`;
+  function describeMeta(meta) {
+    const when = new Date(meta.cachedAt).toLocaleString('en-US');
+    const imgs = meta.withImages != null ? ` · ${meta.withImages} with images` : '';
+    return `${meta.total} likes total${imgs} · updated ${when} · click a day, or search by tag`;
   }
 
   async function runFetch() {
     refreshBtn.disabled = true;
+    showCalendar();
+    chipsBox.innerHTML = '';
     calBox.innerHTML = '';
     const prog = document.createElement('div');
     prog.className = 'tlc-progress';
-    prog.textContent = 'Waiting for the Tumblr API\u2026';
+    prog.textContent = 'Waiting for the Tumblr API…';
     calBox.appendChild(prog);
 
     const ok = await waitForApi();
@@ -340,10 +816,12 @@
     }
 
     try {
-      const data = await gatherLikes((n) => { prog.textContent = `Found ${n} likes\u2026`; });
-      saveCache(data);
-      subEl.textContent = describeCache(data);
-      renderCalendar(calBox, data);
+      const meta = await scanLikes((n) => { prog.textContent = `Found ${n} likes…`; });
+      clearLegacyCache();
+      currentMeta = meta;
+      subEl.textContent = describeMeta(meta);
+      renderTopTags(meta);
+      renderCalendar(calBox, meta);
     } catch (err) {
       prog.className = 'tlc-err';
       prog.textContent = 'Error while fetching likes:\n' + (err && err.message ? err.message : String(err));
@@ -362,7 +840,7 @@
       if (!launcher) {
         launcher = document.createElement('button');
         launcher.id = 'tlc-launcher';
-        launcher.textContent = '\uD83D\uDCC5 Likes calendar';
+        launcher.textContent = '📅 Likes calendar';
         launcher.addEventListener('click', openPanel);
         document.body.appendChild(launcher);
       }
@@ -372,7 +850,6 @@
     }
   }
 
-  // Tumblr is a single-page app: watch for soft navigations.
   function patchHistory() {
     const fire = () => window.dispatchEvent(new Event('tlc:locationchange'));
     for (const m of ['pushState', 'replaceState']) {
