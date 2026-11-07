@@ -19,6 +19,7 @@ Tumblr's likes can't be searched or filtered, so finding an image you saved mont
 
 📦 Available on Firefox Add-ons: https://addons.mozilla.org/firefox/addon/tumblr-likes-calendar/
 
+📦 Available on Google Chrome Add-ons: https://chromewebstore.google.com/detail/tumblr-likes-calendar/dhpphdeacendokgoaceccnghjjeineld
 Features
 
 Heatmap calendar of your likes, one panel per year.
