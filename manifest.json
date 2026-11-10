@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Tumblr Likes Calendar",
-  "version": "0.2.0",
-  "description": "Adds a heatmap calendar of your likes to the Tumblr Likes page. Click a day to jump to that date, or search your likes by tag.",
+  "version": "0.3.0",
+  "description": "Heatmap calendar of your Tumblr likes with tag search, plus the image posts of blogs you follow, searchable by tag.",
   "browser_specific_settings": {
     "gecko": {
       "id": "tumblr-likes-calendar@local.dev",
