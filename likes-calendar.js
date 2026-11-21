@@ -1,9 +1,26 @@
 /*
- * Tumblr Likes Calendar  —  v0.3.0
+ * Tumblr Likes Calendar  —  v0.4.1
  * --------------------------------
  * Runs in the MAIN world (page context) so it can use window.tumblr.apiFetch,
  * the authenticated fetch helper Tumblr exposes to extensions. No API key,
  * no OAuth: it piggybacks on your logged-in session.
+ *
+ * What's new in 0.4.1:
+ *   - The gallery is now virtualized: it can show ALL your liked images, not
+ *     just the 400 most recent, while keeping the page light. Only the rows
+ *     visible on screen are drawn in the DOM and recycled as you scroll, so the
+ *     browser stays fast even with tens of thousands of likes.
+ *   - Filter the gallery in place: a search box above the grid filters by tag,
+ *     or by "blog:name", without leaving the gallery. Click an image's blog
+ *     caption to filter to that blog.
+ *   - A year/month jump rail on the right lets you leap straight to any period
+ *     instead of scrolling for ages.
+ *
+ * What's new in 0.4.0:
+ *   - Gallery view of your likes: a "Gallery" toggle on the Calendar tab shows
+ *     your liked image posts as a thumbnail grid, newest first.
+ *   - Search your likes by blog: type "blog:name" in the search box, or click a
+ *     blog name in any result, to list every like from that blog.
  *
  * What's new in 0.3.0:
  *   - "Blog seguiti" (followed blogs): a second tab that indexes the original
@@ -45,7 +62,12 @@
   const FOLLOW_PAGE_SLEEP_MS = 160;     // pause between following-list pages
   const TOP_TAGS_KEEP = 40;
   const SEARCH_RESULT_LIMIT = 300;
-  const FOLLOWED_RESULT_LIMIT = 400;    // cap rendered thumbnails
+  const FOLLOWED_RESULT_LIMIT = 400;    // cap rendered thumbnails (followed-blog search)
+  // Gallery virtual scrolling: no cap on how many images it can browse — only the
+  // on-screen rows live in the DOM at any moment.
+  const GAL_MIN = 118;                  // min thumbnail size (px), matches the grid
+  const GAL_GAP = 8;                    // gap between thumbnails (px)
+  const GAL_OVERSCAN = 3;               // extra rows drawn above/below the viewport
   const DOW = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
   const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
@@ -131,6 +153,55 @@
     const idx = tx.objectStore(STORE_POSTS).index('tags');
     const out = await reqDone(idx.getAll(IDBKeyRange.only(key)));
     out.sort((a, b) => (b.ts || 0) - (a.ts || 0));
+    return out;
+  }
+
+  // All likes whose liked post belongs to a given blog, newest-first.
+  async function postsByBlog(blog) {
+    const name = String(blog == null ? '' : blog).trim();
+    if (!name) return [];
+    const db = await openDB();
+    const tx = db.transaction(STORE_POSTS, 'readonly');
+    const idx = tx.objectStore(STORE_POSTS).index('blog');
+    const out = await reqDone(idx.getAll(IDBKeyRange.only(name)));
+    out.sort((a, b) => (b.ts || 0) - (a.ts || 0));
+    return out;
+  }
+
+  // All likes liked on a given LOCAL day (dayKey 'YYYY-MM-DD'), newest-first.
+  // Uses the same local-day bucketing as the heatmap, so counts match exactly.
+  async function postsByDay(key) {
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(key || ''));
+    if (!m) return [];
+    const start = new Date(+m[1], +m[2] - 1, +m[3], 0, 0, 0, 0);
+    const end = new Date(+m[1], +m[2] - 1, +m[3] + 1, 0, 0, 0, 0);
+    const lo = Math.floor(start.getTime() / 1000);
+    const hi = Math.floor(end.getTime() / 1000);   // exclusive upper bound
+    const db = await openDB();
+    const tx = db.transaction(STORE_POSTS, 'readonly');
+    const idx = tx.objectStore(STORE_POSTS).index('ts');
+    const out = await reqDone(idx.getAll(IDBKeyRange.bound(lo, hi, false, true)));
+    out.sort((a, b) => (b.ts || 0) - (a.ts || 0));
+    return out;
+  }
+
+  // Newest-first liked posts that have at least one image, up to `limit`.
+  async function likesWithImages(limit) {
+    const db = await openDB();
+    const tx = db.transaction(STORE_POSTS, 'readonly');
+    const idx = tx.objectStore(STORE_POSTS).index('ts');
+    const out = [];
+    await new Promise((resolve, reject) => {
+      const cur = idx.openCursor(null, 'prev'); // newest first
+      cur.onsuccess = () => {
+        const c = cur.result;
+        if (!c || out.length >= limit) { resolve(); return; }
+        const r = c.value;
+        if (r && r.images && r.images.length) out.push(r);
+        c.continue();
+      };
+      cur.onerror = () => reject(cur.error);
+    });
     return out;
   }
 
@@ -426,6 +497,8 @@
       .tlc-rmeta { min-width: 0; flex: 1; }
       .tlc-rtop { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
       .tlc-rblog { font-weight: 700; color: #e8ecf1; }
+      .tlc-rblog-link { cursor: pointer; }
+      .tlc-rblog-link:hover { color: #9ec7ff; text-decoration: underline; }
       .tlc-rdate { color: #8ea0b5; font-size: 12px; }
       .tlc-ropen { margin-left: auto; }
       .tlc-rsummary { color: #c3cedb; margin: 3px 0 5px; overflow: hidden;
@@ -447,6 +520,37 @@
         background: linear-gradient(transparent, #000c); color: #fff; font-size: 11px;
         padding: 14px 6px 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
       .tlc-gi:hover { outline: 2px solid #2ea043; }
+      .tlc-gi-blog.tlc-gi-blog-link { cursor: pointer; }
+      .tlc-gi-blog.tlc-gi-blog-link:hover { color: #9ec7ff; text-decoration: underline; }
+
+      /* virtualized gallery */
+      .tlc-gallery-bar { display: flex; gap: 8px; align-items: center; margin: 2px 0 8px; }
+      .tlc-gallery-bar input {
+        flex: 1; background: #0d1319; color: #e8ecf1; border: 1px solid #ffffff26;
+        border-radius: 8px; padding: 8px 11px; font: 14px system-ui, sans-serif;
+      }
+      .tlc-gallery-bar input::placeholder { color: #6b7e92; }
+      .tlc-gallery-wrap { display: flex; gap: 10px; align-items: flex-start; }
+      .tlc-gallery-scroller {
+        position: relative; flex: 1; min-width: 0; max-height: 62vh;
+        overflow-y: auto; overflow-x: hidden;
+        border: 1px solid #ffffff14; border-radius: 8px; background: #0d131933;
+      }
+      .tlc-gallery-spacer { position: relative; width: 100%; }
+      .tlc-gi-abs { position: absolute; margin: 0; }
+      .tlc-rail {
+        width: 62px; flex: none; max-height: 62vh; overflow-y: auto;
+        font-size: 12px; color: #9fb0c3; padding-right: 2px;
+      }
+      .tlc-rail-year {
+        font-weight: 700; color: #cbd6e2; cursor: pointer; padding: 4px 4px 2px;
+        position: sticky; top: 0; background: #12181f; z-index: 1;
+      }
+      .tlc-rail-year:hover { color: #fff; }
+      .tlc-rail-months { display: flex; flex-direction: column; gap: 1px; margin: 0 0 6px 8px; }
+      .tlc-rail-month { cursor: pointer; padding: 1px 2px; border-radius: 4px; }
+      .tlc-rail-month:hover { color: #fff; background: #ffffff10; }
+      .tlc-rail-on { color: #57e06e !important; }
 
       /* blog list */
       .tlc-bloglist { margin-top: 6px; max-height: 420px; overflow: auto;
@@ -709,7 +813,15 @@
 
     for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
       const weekday = d.getDay();
-      const dayOfYear = Math.floor((d - start) / 86400000);
+      // DST-safe day index: count whole calendar days via UTC (no 23/25-hour
+      // days), so the column always matches the real weekday. Using
+      // (d - start) in milliseconds drifts by one across DST changes, which
+      // misaligned every cell between spring and autumn (e.g. clicking the cell
+      // that looked like Oct 19 landed on a different day).
+      const dayOfYear = Math.round(
+        (Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()) -
+         Date.UTC(start.getFullYear(), start.getMonth(), start.getDate())) / 86400000
+      );
       const col = Math.floor((dayOfYear + start.getDay()) / 7);
       const key = dayKey(d);
       const c = counts[key] || 0;
@@ -719,9 +831,8 @@
       cell.style.gridColumn = (col + 1 - firstCol);
       cell.title = `${key} — ${c} likes`;
       if (key <= todayKey) {
-        const endOfDay = new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1, 0, 0, 0);
-        const before = Math.floor(endOfDay.getTime() / 1000);
-        cell.addEventListener('click', () => { window.location.assign('/likes?before=' + before); });
+        cell.style.cursor = 'pointer';
+        cell.addEventListener('click', () => { doDaySearch(key); });
       } else {
         cell.style.visibility = 'hidden';
       }
@@ -807,8 +918,10 @@
     const top = document.createElement('div');
     top.className = 'tlc-rtop';
     const blog = document.createElement('span');
-    blog.className = 'tlc-rblog';
+    blog.className = 'tlc-rblog tlc-rblog-link';
     blog.textContent = rec.blog;
+    blog.title = 'See your likes from ' + rec.blog;
+    blog.addEventListener('click', () => doBlogSearch(rec.blog));
     const date = document.createElement('span');
     date.className = 'tlc-rdate';
     date.textContent = fmtDate(rec.ts);
@@ -842,10 +955,14 @@
   }
 
   async function doSearch(tag) {
+    const raw = String(tag == null ? '' : tag).trim();
+    const bm = /^blog:\s*(.+)$/i.exec(raw);
+    if (bm) { return doBlogSearch(bm[1].trim()); }
     const q = normTag(tag);
     searchInput.value = tag;
     showingSearch = true;
     calBox.style.display = 'none';
+    galleryBox.style.display = 'none';
     chipsBox.style.display = 'none';
     resultsBox.style.display = 'block';
     resultsBox.innerHTML = '';
@@ -854,12 +971,12 @@
     bar.className = 'tlc-search';
     const back = document.createElement('span');
     back.className = 'tlc-back';
-    back.textContent = '← Back to calendar';
-    back.addEventListener('click', showCalendar);
+    back.textContent = '← Back';
+    back.addEventListener('click', showBrowse);
     bar.appendChild(back);
     resultsBox.appendChild(bar);
 
-    if (!q) { showCalendar(); return; }
+    if (!q) { showBrowse(); return; }
 
     const header = document.createElement('div');
     header.className = 'tlc-sub';
@@ -911,6 +1028,135 @@
     }
   }
 
+  async function doBlogSearch(blog) {
+    const name = String(blog == null ? '' : blog).trim();
+    searchInput.value = name ? ('blog:' + name) : '';
+    showingSearch = true;
+    calBox.style.display = 'none';
+    galleryBox.style.display = 'none';
+    chipsBox.style.display = 'none';
+    resultsBox.style.display = 'block';
+    resultsBox.innerHTML = '';
+
+    const bar = document.createElement('div');
+    bar.className = 'tlc-search';
+    const back = document.createElement('span');
+    back.className = 'tlc-back';
+    back.textContent = '← Back';
+    back.addEventListener('click', showBrowse);
+    bar.appendChild(back);
+    resultsBox.appendChild(bar);
+
+    if (!name) { showBrowse(); return; }
+
+    const header = document.createElement('div');
+    header.className = 'tlc-sub';
+    resultsBox.appendChild(header);
+
+    let matches = [];
+    try {
+      matches = await postsByBlog(name);
+    } catch (err) {
+      header.className = 'tlc-err';
+      header.textContent = 'Search error: ' + (err && err.message ? err.message : String(err));
+      return;
+    }
+
+    header.textContent = matches.length
+      ? `${matches.length} like${matches.length === 1 ? '' : 's'} from “${name}”`
+      : `No likes from “${name}”. (Blog names are case-sensitive.)`;
+    if (!matches.length) return;
+
+    const list = document.createElement('div');
+    list.className = 'tlc-results';
+    const shown = matches.slice(0, SEARCH_RESULT_LIMIT);
+    for (const rec of shown) list.appendChild(renderResult(rec));
+    resultsBox.appendChild(list);
+
+    if (matches.length > shown.length) {
+      const more = document.createElement('div');
+      more.className = 'tlc-sub';
+      more.style.marginTop = '12px';
+      more.textContent = `Showing the first ${shown.length} of ${matches.length}.`;
+      resultsBox.appendChild(more);
+    }
+  }
+
+  // Show the likes of one LOCAL day inside the panel. Reliable to the day,
+  // unlike linking to Tumblr's /likes page (which paginates newest-first and
+  // can't be pinned to an exact date).
+  async function doDaySearch(key) {
+    showingSearch = true;
+    searchInput.value = '';
+    calBox.style.display = 'none';
+    galleryBox.style.display = 'none';
+    chipsBox.style.display = 'none';
+    resultsBox.style.display = 'block';
+    resultsBox.innerHTML = '';
+
+    const bar = document.createElement('div');
+    bar.className = 'tlc-search';
+    const back = document.createElement('span');
+    back.className = 'tlc-back';
+    back.textContent = '← Back';
+    back.addEventListener('click', showBrowse);
+    bar.appendChild(back);
+    resultsBox.appendChild(bar);
+
+    const header = document.createElement('div');
+    header.className = 'tlc-sub';
+    resultsBox.appendChild(header);
+
+    let matches = [];
+    try {
+      matches = await postsByDay(key);
+    } catch (err) {
+      header.className = 'tlc-err';
+      header.textContent = 'Error: ' + (err && err.message ? err.message : String(err));
+      return;
+    }
+
+    let pretty = key;
+    const dm = /^(\d{4})-(\d{2})-(\d{2})$/.exec(key);
+    if (dm) {
+      try {
+        pretty = new Date(+dm[1], +dm[2] - 1, +dm[3]).toLocaleDateString('en-US',
+          { weekday: 'short', year: 'numeric', month: 'short', day: 'numeric' });
+      } catch { /* keep key */ }
+    }
+    header.textContent = matches.length
+      ? `${matches.length} like${matches.length === 1 ? '' : 's'} on ${pretty}`
+      : `No likes on ${pretty}.`;
+
+    // Keep a way to open that day on Tumblr too (approximate, newest-first).
+    const dayEnd = dm ? Math.floor(new Date(+dm[1], +dm[2] - 1, +dm[3] + 1).getTime() / 1000) : null;
+    if (dayEnd) {
+      const open = document.createElement('a');
+      open.className = 'tlc-btn';
+      open.style.marginLeft = '10px';
+      open.textContent = 'Open on Tumblr ↗';
+      open.href = '/likes?before=' + dayEnd;
+      open.title = 'Opens Tumblr around this day (Tumblr shows likes newest-first, so it may not land exactly).';
+      bar.appendChild(open);
+    }
+
+    if (!matches.length) return;
+
+    const list = document.createElement('div');
+    list.className = 'tlc-results';
+    const shown = matches.slice(0, SEARCH_RESULT_LIMIT);
+    for (const rec of shown) list.appendChild(renderResult(rec));
+    resultsBox.appendChild(list);
+
+    if (matches.length > shown.length) {
+      const more = document.createElement('div');
+      more.className = 'tlc-sub';
+      more.style.marginTop = '12px';
+      more.textContent = `Showing the first ${shown.length} of ${matches.length}.`;
+      resultsBox.appendChild(more);
+    }
+  }
+
   function makeChip(tag, n) {
     const chip = document.createElement('span');
     chip.className = 'tlc-chip';
@@ -938,12 +1184,251 @@
     chipsBox.appendChild(cloud);
   }
 
-  function showCalendar() {
+  function showBrowse() {
     showingSearch = false;
     resultsBox.style.display = 'none';
     resultsBox.innerHTML = '';
-    calBox.style.display = 'block';
-    chipsBox.style.display = 'block';
+    const gal = (browseMode === 'gallery');
+    // In gallery mode the gallery has its own filter box, so hide the heatmap's
+    // search field and the top-tags chips to keep the view uncluttered.
+    if (searchWrap) searchWrap.style.display = gal ? 'none' : 'flex';
+    chipsBox.style.display = gal ? 'none' : 'block';
+    calBox.style.display = gal ? 'none' : 'block';
+    galleryBox.style.display = gal ? 'block' : 'none';
+  }
+
+  async function setBrowseMode(mode) {
+    browseMode = mode;
+    if (calBtn) calBtn.classList.toggle('tlc-primary', mode === 'calendar');
+    if (galBtn) galBtn.classList.toggle('tlc-primary', mode === 'gallery');
+    showBrowse();                       // make the gallery visible BEFORE measuring it
+    if (mode === 'gallery') await renderLikesGallery();
+  }
+
+  // ---- virtualized likes gallery -----------------------------------------
+  // galleryItems is a slim projection (one image per liked post) so we can hold
+  // every liked image in memory cheaply; the DOM only ever holds the visible rows.
+  function galleryFilterTo(q) {
+    if (galleryFilterInput) galleryFilterInput.value = q;
+    applyGalleryFilter(q);
+  }
+
+  async function applyGalleryFilter(q) {
+    galleryFilter = String(q == null ? '' : q).trim();
+    await renderLikesGallery();
+  }
+
+  async function loadGalleryData(filter) {
+    const f = String(filter == null ? '' : filter).trim();
+    const bm = /^blog:\s*(.+)$/i.exec(f);
+    let recs;
+    if (bm) recs = await postsByBlog(bm[1].trim());
+    else if (f) recs = await postsByTag(f);
+    else recs = await likesWithImages(Infinity);   // all likes with images, newest-first
+    const out = [];
+    for (const r of recs) {
+      if (r && r.images && r.images.length) {
+        out.push({ img: r.images[0], blog: r.blog, ts: r.ts || 0, url: r.postUrl });
+      }
+    }
+    return out;
+  }
+
+  function computeGalleryLayout() {
+    const w = galleryScroller ? galleryScroller.clientWidth : 0;
+    if (w <= 0) { galleryCols = 0; return; }
+    const cols = Math.max(1, Math.floor((w + GAL_GAP) / (GAL_MIN + GAL_GAP)));
+    const colW = Math.max(1, Math.floor((w - (cols - 1) * GAL_GAP) / cols));
+    galleryCols = cols;
+    galleryColW = colW;
+    galleryRowH = colW + GAL_GAP;
+  }
+
+  function galleryRowCount() {
+    return galleryCols ? Math.ceil(galleryItems.length / galleryCols) : 0;
+  }
+
+  function layoutGallerySpacer() {
+    gallerySpacer.style.height = (galleryRowCount() * galleryRowH) + 'px';
+  }
+
+  function buildGalleryCell(item, i) {
+    const row = Math.floor(i / galleryCols);
+    const col = i % galleryCols;
+    const a = document.createElement('a');
+    a.className = 'tlc-gi tlc-gi-abs';
+    a.style.width = galleryColW + 'px';
+    a.style.height = galleryColW + 'px';
+    a.style.left = (col * (galleryColW + GAL_GAP)) + 'px';
+    a.style.top = (row * galleryRowH) + 'px';
+    a.href = item.url;
+    a.target = '_blank';
+    a.rel = 'noopener';
+    a.title = item.blog + (item.ts ? ' — ' + fmtDate(item.ts) : '');
+    const img = document.createElement('img');
+    img.loading = 'lazy';
+    img.src = item.img;
+    img.alt = '';
+    img.addEventListener('error', () => { a.style.visibility = 'hidden'; });
+    const cap = document.createElement('span');
+    cap.className = 'tlc-gi-blog tlc-gi-blog-link';
+    cap.textContent = item.blog;
+    cap.title = 'Filter the gallery to ' + item.blog;
+    cap.addEventListener('click', (e) => {
+      e.preventDefault(); e.stopPropagation();
+      galleryFilterTo('blog:' + item.blog);
+    });
+    a.append(img, cap);
+    return a;
+  }
+
+  function currentTopIndex() {
+    if (!galleryRowH || !galleryCols) return 0;
+    const firstRow = Math.floor(galleryScroller.scrollTop / galleryRowH);
+    return firstRow * galleryCols;
+  }
+
+  function renderGalleryWindow() {
+    if (!galleryItems.length || !galleryCols) return;
+    const scrollTop = galleryScroller.scrollTop;
+    const vh = galleryScroller.clientHeight || 1;
+    const rows = galleryRowCount();
+    const firstRow = Math.max(0, Math.floor(scrollTop / galleryRowH) - GAL_OVERSCAN);
+    const lastRow = Math.min(rows, Math.ceil((scrollTop + vh) / galleryRowH) + GAL_OVERSCAN);
+    const firstIdx = firstRow * galleryCols;
+    const lastIdx = Math.min(galleryItems.length, lastRow * galleryCols);
+
+    // Recycle: drop cells that scrolled out, keep the ones still in range.
+    for (const [idx, el] of galleryPool) {
+      if (idx < firstIdx || idx >= lastIdx) { el.remove(); galleryPool.delete(idx); }
+    }
+    for (let i = firstIdx; i < lastIdx; i++) {
+      if (galleryPool.has(i)) continue;
+      const el = buildGalleryCell(galleryItems[i], i);
+      gallerySpacer.appendChild(el);
+      galleryPool.set(i, el);
+    }
+  }
+
+  function clearGalleryPool() {
+    for (const [, el] of galleryPool) el.remove();
+    galleryPool.clear();
+  }
+
+  function buildGalleryRail() {
+    galleryRail.innerHTML = '';
+    if (!galleryItems.length) return;
+    // Group consecutive items by year, then by month (items are newest-first).
+    let curY = null, curM = null;
+    for (let i = 0; i < galleryItems.length; i++) {
+      const d = new Date((galleryItems[i].ts || 0) * 1000);
+      const y = d.getFullYear(), m = d.getMonth();
+      if (!curY || curY.year !== y) {
+        curY = document.createElement('div');
+        curY.className = 'tlc-rail-year';
+        curY.textContent = String(y);
+        curY.dataset.idx = i;
+        curY.year = y;
+        curY.addEventListener('click', () => scrollGalleryToIndex(i));
+        galleryRail.appendChild(curY);
+        curM = document.createElement('div');
+        curM.className = 'tlc-rail-months';
+        galleryRail.appendChild(curM);
+        curM.month = -1;
+      }
+      if (curM.month !== m) {
+        curM.month = m;
+        const mEl = document.createElement('span');
+        mEl.className = 'tlc-rail-month';
+        mEl.textContent = MONTHS[m];
+        mEl.dataset.idx = i;
+        mEl.addEventListener('click', () => scrollGalleryToIndex(i));
+        curM.appendChild(mEl);
+      }
+    }
+  }
+
+  function updateRailActive() {
+    if (!galleryRail || !galleryItems.length) return;
+    const topIdx = currentTopIndex();
+    let active = null;
+    galleryRail.querySelectorAll('[data-idx]').forEach((el) => {
+      el.classList.remove('tlc-rail-on');
+      if (+el.dataset.idx <= topIdx) active = el;
+    });
+    if (active) active.classList.add('tlc-rail-on');
+  }
+
+  function scrollGalleryToIndex(i) {
+    if (!galleryCols) return;
+    const row = Math.floor(i / galleryCols);
+    galleryScroller.scrollTop = row * galleryRowH;
+    renderGalleryWindow();
+    updateRailActive();
+  }
+
+  function onGalleryScroll() {
+    if (galleryRaf) return;
+    galleryRaf = requestAnimationFrame(() => {
+      galleryRaf = 0;
+      renderGalleryWindow();
+      updateRailActive();
+    });
+  }
+
+  function onGalleryResize() {
+    if (browseMode !== 'gallery' || !galleryItems.length) return;
+    const anchor = currentTopIndex();
+    computeGalleryLayout();
+    if (!galleryCols) return;
+    layoutGallerySpacer();
+    clearGalleryPool();                 // positions and column count changed
+    const row = Math.floor(anchor / galleryCols);
+    galleryScroller.scrollTop = row * galleryRowH;
+    renderGalleryWindow();
+    updateRailActive();
+  }
+
+  async function renderLikesGallery() {
+    clearGalleryPool();
+    gallerySpacer.innerHTML = '';
+    let items;
+    try {
+      items = await loadGalleryData(galleryFilter);
+    } catch (err) {
+      galleryNote.className = 'tlc-err';
+      galleryNote.textContent = 'Gallery error: ' + (err && err.message ? err.message : String(err));
+      galleryItems = [];
+      gallerySpacer.style.height = '0px';
+      galleryRail.innerHTML = '';
+      return;
+    }
+    galleryNote.className = 'tlc-sub';
+    galleryItems = items;
+
+    if (!items.length) {
+      gallerySpacer.style.height = '0px';
+      galleryRail.innerHTML = '';
+      galleryNote.textContent = galleryFilter
+        ? `No liked images match “${galleryFilter}”.`
+        : 'No liked posts with images yet. Press “Refresh likes”.';
+      return;
+    }
+
+    galleryNote.textContent = galleryFilter
+      ? `${items.length} liked image${items.length === 1 ? '' : 's'} matching “${galleryFilter}”.`
+      : `${items.length} liked image${items.length === 1 ? '' : 's'} — scroll freely; jump by year on the right.`;
+
+    galleryScroller.scrollTop = 0;
+    computeGalleryLayout();
+    buildGalleryRail();
+    if (galleryCols) {
+      layoutGallerySpacer();
+      renderGalleryWindow();
+      updateRailActive();
+    }
+    // If the gallery isn't measurable yet (just made visible), the ResizeObserver
+    // fires once it has a size and lays everything out.
   }
 
   // ---- followed-blogs UI --------------------------------------------------
@@ -1319,7 +1804,16 @@
   // ---- panel / UI ---------------------------------------------------------
   let overlay, panelTitle;
   // calendar view elements
-  let calBox, chipsBox, resultsBox, subEl, refreshBtn, searchInput, calRoot;
+  let calBox, chipsBox, resultsBox, subEl, refreshBtn, searchInput, searchWrap, calRoot,
+      galleryBox, calBtn, galBtn;
+  let browseMode = 'calendar';          // 'calendar' | 'gallery'
+  // virtualized gallery elements + state
+  let galleryFilterInput, galleryNote, galleryScroller, gallerySpacer, galleryRail, galleryRO;
+  let galleryItems = [];                 // [{img, blog, ts, url}] newest-first
+  let galleryFilter = '';                // '', a tag, or 'blog:name'
+  let galleryCols = 0, galleryColW = 0, galleryRowH = 0;
+  let galleryRaf = 0;
+  const galleryPool = new Map();         // index -> rendered cell element
   // followed view elements
   let followedRoot, fSub, fProgress, fSearchInput, fResultsBox, fBlogListBox,
       fLoadBtn, fCountBtn, fScanAllBtn, fScanSelBtn, fStopBtn;
@@ -1357,17 +1851,25 @@
     refreshBtn.className = 'tlc-btn';
     refreshBtn.textContent = 'Refresh likes';
     refreshBtn.addEventListener('click', runFetch);
-    controls.appendChild(refreshBtn);
+    calBtn = document.createElement('button');
+    calBtn.className = 'tlc-btn tlc-primary';
+    calBtn.textContent = '📅 Heatmap';
+    calBtn.addEventListener('click', () => setBrowseMode('calendar'));
+    galBtn = document.createElement('button');
+    galBtn.className = 'tlc-btn';
+    galBtn.textContent = '🖼 Gallery';
+    galBtn.addEventListener('click', () => setBrowseMode('gallery'));
+    controls.append(refreshBtn, calBtn, galBtn);
     subEl = document.createElement('div');
     subEl.className = 'tlc-sub';
     subEl.style.margin = '0';
     controls.appendChild(subEl);
 
-    const search = document.createElement('div');
-    search.className = 'tlc-search';
+    searchWrap = document.createElement('div');
+    searchWrap.className = 'tlc-search';
     searchInput = document.createElement('input');
     searchInput.type = 'search';
-    searchInput.placeholder = 'Search your likes by tag…';
+    searchInput.placeholder = 'Search likes by tag, or blog:name…';
     searchInput.addEventListener('keydown', (e) => {
       if (e.key === 'Enter') { e.preventDefault(); doSearch(searchInput.value); }
     });
@@ -1375,15 +1877,66 @@
     searchBtn.className = 'tlc-btn';
     searchBtn.textContent = 'Search';
     searchBtn.addEventListener('click', () => doSearch(searchInput.value));
-    search.append(searchInput, searchBtn);
+    searchWrap.append(searchInput, searchBtn);
 
     chipsBox = document.createElement('div');
     resultsBox = document.createElement('div');
     resultsBox.style.display = 'none';
     calBox = document.createElement('div');
+    galleryBox = document.createElement('div');
+    galleryBox.style.display = 'none';
+    buildGallerySkeleton();
 
-    calRoot.append(controls, search, chipsBox, resultsBox, calBox);
+    calRoot.append(controls, searchWrap, chipsBox, resultsBox, calBox, galleryBox);
     return calRoot;
+  }
+
+  // Build the gallery's static DOM once: filter bar, note, scroller + spacer, and
+  // the year/month rail. Data is (re)loaded later by renderLikesGallery().
+  function buildGallerySkeleton() {
+    const bar = document.createElement('div');
+    bar.className = 'tlc-gallery-bar';
+    galleryFilterInput = document.createElement('input');
+    galleryFilterInput.type = 'search';
+    galleryFilterInput.placeholder = 'Filter likes by tag, or blog:name…';
+    galleryFilterInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); applyGalleryFilter(galleryFilterInput.value); }
+    });
+    const goBtn = document.createElement('button');
+    goBtn.className = 'tlc-btn';
+    goBtn.textContent = 'Filter';
+    goBtn.addEventListener('click', () => applyGalleryFilter(galleryFilterInput.value));
+    const clearBtn = document.createElement('button');
+    clearBtn.className = 'tlc-btn';
+    clearBtn.textContent = 'Clear';
+    clearBtn.addEventListener('click', () => { galleryFilterInput.value = ''; applyGalleryFilter(''); });
+    bar.append(galleryFilterInput, goBtn, clearBtn);
+
+    galleryNote = document.createElement('div');
+    galleryNote.id = 'tlc-gallery-note';
+    galleryNote.className = 'tlc-sub';
+    galleryNote.style.margin = '0 0 8px';
+
+    const wrap = document.createElement('div');
+    wrap.className = 'tlc-gallery-wrap';
+    galleryScroller = document.createElement('div');
+    galleryScroller.className = 'tlc-gallery-scroller';
+    gallerySpacer = document.createElement('div');
+    gallerySpacer.className = 'tlc-gallery-spacer';
+    galleryScroller.appendChild(gallerySpacer);
+    galleryRail = document.createElement('div');
+    galleryRail.className = 'tlc-rail';
+    wrap.append(galleryScroller, galleryRail);
+
+    galleryScroller.addEventListener('scroll', onGalleryScroll);
+    if (typeof ResizeObserver === 'function') {
+      galleryRO = new ResizeObserver(() => onGalleryResize());
+      galleryRO.observe(galleryScroller);
+    } else {
+      window.addEventListener('resize', onGalleryResize);
+    }
+
+    galleryBox.append(bar, galleryNote, wrap);
   }
 
   function buildFollowedView() {
@@ -1495,7 +2048,8 @@
     if (!overlay) buildPanel();
     overlay.classList.add('tlc-open');
     showView('calendar');
-    showCalendar();
+    browseMode = 'calendar';
+    showBrowse();
 
     let meta = null;
     try { meta = await getMeta(); } catch { /* ignore */ }
@@ -1532,7 +2086,8 @@
 
   async function runFetch() {
     refreshBtn.disabled = true;
-    showCalendar();
+    browseMode = 'calendar';
+    showBrowse();
     chipsBox.innerHTML = '';
     calBox.innerHTML = '';
     const prog = document.createElement('div');
