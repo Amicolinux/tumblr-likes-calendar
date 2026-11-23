@@ -83,6 +83,11 @@
     const s = typeof u === 'string' ? u.trim() : '';
     return SAFE_URL_RE.test(s) ? s : '';
   };
+  // https://<blog>.tumblr.com[path] only for a plain Tumblr blog name: a name
+  // like "evil.com/x" would otherwise move the link to another host. '' if not.
+  const BLOG_NAME_RE = /^[a-z0-9-]+$/i;
+  const blogUrl = (blog, path = '') =>
+    (typeof blog === 'string' && BLOG_NAME_RE.test(blog)) ? `https://${blog}.tumblr.com${path}` : '';
 
   // ---- IndexedDB layer ----------------------------------------------------
   let _dbPromise = null;
@@ -368,7 +373,7 @@
       tags: norm,
       tagsRaw: display,
       images: extractImages(post),
-      postUrl: post.postUrl || post.post_url || `https://${blog}.tumblr.com/post/${id}`,
+      postUrl: post.postUrl || post.post_url || blogUrl(blog, `/post/${encodeURIComponent(id)}`),
       summary: (post.summary || '').slice(0, 200),
     };
   }
@@ -406,7 +411,7 @@
       tags: norm,
       tagsRaw: display,
       images,
-      postUrl: post.postUrl || post.post_url || `https://${blog}.tumblr.com/post/${id}`,
+      postUrl: post.postUrl || post.post_url || blogUrl(blog, `/post/${encodeURIComponent(id)}`),
       summary: (post.summary || '').slice(0, 200),
     };
   }
@@ -956,6 +961,7 @@
     const bm = /^blog:\s*(.+)$/i.exec(raw);
     if (bm) { return doBlogSearch(bm[1].trim()); }
     const q = normTag(tag);
+    const seq = ++likesSearchSeq;
     searchInput.value = tag;
     showingSearch = true;
     calBox.style.display = 'none';
@@ -983,10 +989,12 @@
     try {
       matches = await postsByTag(q);
     } catch (err) {
+      if (seq !== likesSearchSeq) return;
       header.className = 'tlc-err';
       header.textContent = 'Search error: ' + (err && err.message ? err.message : String(err));
       return;
     }
+    if (seq !== likesSearchSeq) return;   // a newer search took over
 
     header.textContent = matches.length
       ? `${matches.length} like${matches.length === 1 ? '' : 's'} tagged “${q}”`
@@ -995,6 +1003,7 @@
     if (!matches.length) {
       try {
         const all = await distinctTags();
+        if (seq !== likesSearchSeq) return;
         const near = all.filter((t) => t.includes(q)).slice(0, 30);
         if (near.length) {
           const sug = document.createElement('div');
@@ -1027,6 +1036,7 @@
 
   async function doBlogSearch(blog) {
     const name = String(blog == null ? '' : blog).trim();
+    const seq = ++likesSearchSeq;
     searchInput.value = name ? ('blog:' + name) : '';
     showingSearch = true;
     calBox.style.display = 'none';
@@ -1054,10 +1064,12 @@
     try {
       matches = await postsByBlog(name);
     } catch (err) {
+      if (seq !== likesSearchSeq) return;
       header.className = 'tlc-err';
       header.textContent = 'Search error: ' + (err && err.message ? err.message : String(err));
       return;
     }
+    if (seq !== likesSearchSeq) return;   // a newer search took over
 
     header.textContent = matches.length
       ? `${matches.length} like${matches.length === 1 ? '' : 's'} from “${name}”`
@@ -1085,6 +1097,7 @@
   // after load, landing on a later day). So there is deliberately NO
   // "open this day on Tumblr" link — each result links to its own post instead.
   async function doDaySearch(key) {
+    const seq = ++likesSearchSeq;
     showingSearch = true;
     searchInput.value = '';
     calBox.style.display = 'none';
@@ -1110,10 +1123,12 @@
     try {
       matches = await postsByDay(key);
     } catch (err) {
+      if (seq !== likesSearchSeq) return;
       header.className = 'tlc-err';
       header.textContent = 'Error: ' + (err && err.message ? err.message : String(err));
       return;
     }
+    if (seq !== likesSearchSeq) return;   // a newer search took over
 
     let pretty = key;
     const dm = /^(\d{4})-(\d{2})-(\d{2})$/.exec(key);
@@ -1769,15 +1784,17 @@
         const td0 = document.createElement('td');
         td0.textContent = String(idx + 1);
         const td1 = document.createElement('td');
-        const a = document.createElement('a');
-        const blogHref = safeUrl('https://' + r.blog + '.tumblr.com');
+        const blogHref = safeUrl(blogUrl(r.blog));
         if (blogHref) {
+          const a = document.createElement('a');
           a.href = blogHref;
           a.target = '_blank';
           a.rel = 'noopener';
+          a.textContent = r.blog;
+          td1.appendChild(a);
+        } else {
+          td1.textContent = r.blog;   // invalid blog name: text only, no link
         }
-        a.textContent = r.blog;
-        td1.appendChild(a);
         const td2 = document.createElement('td');
         td2.className = 'tlc-num';
         td2.textContent = (r.posts == null) ? '—' : r.posts.toLocaleString();
@@ -1819,6 +1836,10 @@
   let tabCalBtn, tabFollowBtn;
 
   let showingSearch = false;
+  // Bumped by every likes search (tag, blog:, day). They all render into the
+  // same resultsBox, so after each await a search checks it is still the
+  // latest one and quietly drops its results otherwise.
+  let likesSearchSeq = 0;
   let currentMeta = null;
   let viewMode = 'calendar';
   // followed state

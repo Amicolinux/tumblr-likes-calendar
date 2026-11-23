@@ -42,14 +42,26 @@ async function newCtx(browser, tz) {
 }
 
 // `pageSize` lets big datasets scan in few pages (the extension sleeps between pages).
-async function scan(page, posts, pageSize = PAGE) {
-  await page.addInitScript(({ posts, PAGE }) => {
+// `following` (optional): [{name}] served by /v2/user/following; each followed
+// blog then serves one original image post (no postUrl) on /v2/blog/{name}/posts.
+async function scan(page, posts, pageSize = PAGE, following = null) {
+  await page.addInitScript(({ posts, PAGE, following }) => {
     window.tumblr = { apiFetch: async (res) => {
+      if (following && res.startsWith('/v2/user/following')) {
+        return { response: { blogs: following, totalBlogs: following.length } };
+      }
+      const bm = following && /^\/v2\/blog\/([^/]+)\/posts/.exec(res);
+      if (bm) {
+        const name = decodeURIComponent(bm[1]);
+        const id = 7100 + following.findIndex((b) => b.name === name);
+        return { response: { totalPosts: 1, posts: [{ id, timestamp: 1700000000, tags: ['fbtag'],
+          content: [{ type: 'image', media: [{ url: `https://img.example/${id}.jpg`, width: 500 }] }] }] } };
+      }
       const m = /offset=(\d+)/.exec(res); const o = m ? +m[1] : 0;
       const s = posts.slice(o, o + PAGE); const n = o + PAGE;
       return { response: { likedPosts: s, links: n < posts.length ? { next: { href: `/v2/user/likes?limit=${PAGE}&offset=${n}` } } : undefined } };
     } };
-  }, { posts, PAGE: pageSize });
+  }, { posts, PAGE: pageSize, following });
   await page.goto('https://www.tumblr.com/likes');
   await page.addScriptTag({ content: JS });
   await page.click('#tlc-launcher');
@@ -295,13 +307,19 @@ async function urlSafety(browser) {
   const protoRel = post(7004, base - 180, 'proto', ['xss']);
   protoRel.postUrl = '//proto.tumblr.com/post/7004';
   protoRel.content = [{ type: 'image', media: [{ url: '//img.example/7004.jpg', width: 500 }] }];
-  const posts = [evilLink, evilImg, dataImg, protoRel];
+  // Invalid blog name and no postUrl → toRecord's https://<blog>.tumblr.com fallback.
+  const badBlog = post(7005, base - 240, 'evil.com/x', ['badblog']);
+  delete badBlog.postUrl;
+  const goodBlog = post(7006, base - 300, 'good-blog', ['badblog']);
+  delete goodBlog.postUrl;
+  const posts = [evilLink, evilImg, dataImg, protoRel, badBlog, goodBlog];
+  const following = [{ name: 'good-blog' }, { name: 'evil.com/x' }];
 
   const ctx = await newCtx(browser, 'Europe/Rome');
   const page = await ctx.newPage();
   const errs = [];
   page.on('pageerror', (e) => errs.push(String(e)));
-  await scan(page, posts);
+  await scan(page, posts, PAGE, following);
 
   // Every href/src inside the panel that is currently rendered.
   const unsafe = () => page.evaluate((src) => {
@@ -327,6 +345,15 @@ async function urlSafety(browser) {
   ok(sBad.length === 0, `D: search results have no unsafe href/src (got ${JSON.stringify(sBad)})`);
   ok(!sr.opens.includes('javascript:alert(1)'), `D: javascript: postUrl is not an "Open" link (got ${JSON.stringify(sr.opens)})`);
   ok(sr.opens.includes('//proto.tumblr.com/post/7004'), `D: protocol-relative postUrl stays a link (got ${JSON.stringify(sr.opens)})`);
+
+  // 1b) likes without postUrl: the https://<blog>.tumblr.com/post/<id> fallback
+  // is built only for a valid blog name.
+  await page.fill('input[placeholder^="Search likes"]', 'badblog');
+  await page.press('input[placeholder^="Search likes"]', 'Enter');
+  await page.waitForFunction(() => /2 likes tagged/.test(document.querySelector('#tlc-panel .tlc-sub') ? [...document.querySelectorAll('#tlc-panel .tlc-sub')].map((e) => e.textContent).join(' ') : ''), null, { timeout: 8000 });
+  const fb = await page.evaluate(() => [...document.querySelectorAll('#tlc-panel .tlc-result a.tlc-ropen')].map((a) => a.getAttribute('href')));
+  ok(fb.length === 1 && fb[0] === 'https://good-blog.tumblr.com/post/7006',
+    `D: like fallback URL only for a valid blog name (got ${JSON.stringify(fb)})`);
 
   // 2) gallery (buildGalleryCell)
   await page.evaluate(() => { const b = document.querySelector('#tlc-panel .tlc-back'); if (b) b.click(); });
@@ -375,7 +402,96 @@ async function urlSafety(browser) {
   ok(f.evilHref === null, `D: followed cell with javascript: postUrl is not a link (href=${f.evilHref})`);
   ok(f.protoHref === '//proto.tumblr.com/post/8003', `D: followed keeps protocol-relative link (href=${f.protoHref})`);
 
+  // 4) followed-blog scan: toFollowedRecord's fallback URL, valid names only.
+  await page.click('button:has-text("Download all")');
+  await page.waitForFunction(() => /Scan complete/.test(document.body.textContent), null, { timeout: 15000 });
+  await page.fill('input[placeholder^="Search downloaded posts"]', 'fbtag');
+  await page.press('input[placeholder^="Search downloaded posts"]', 'Enter');
+  await page.waitForFunction(() => /2 posts tagged/.test(document.body.textContent), null, { timeout: 8000 });
+  const sc = await page.evaluate(() => {
+    const grid = [...document.querySelectorAll('#tlc-panel .tlc-grid-imgs')].find((e) => e.offsetParent);
+    const hrefOf = (id) => { const c = [...grid.querySelectorAll('.tlc-gi')].find((x) => (x.querySelector('img').getAttribute('src') || '').includes(id)); return c ? c.getAttribute('href') : 'NO CELL'; };
+    return { good: hrefOf('7100'), bad: hrefOf('7101') };
+  });
+  ok(sc.good === 'https://good-blog.tumblr.com/post/7100', `D: followed fallback URL for valid blog (href=${sc.good})`);
+  ok(sc.bad === null, `D: no followed fallback URL for invalid blog name (href=${sc.bad})`);
+
+  // 5) "Count posts" table: blog link only for a valid blog name, text always.
+  await page.click('button:has-text("Count posts")');
+  await page.waitForFunction(() => document.querySelectorAll('#tlc-panel .tlc-table tbody tr').length === 2, null, { timeout: 15000 });
+  const ct = await page.evaluate(() => [...document.querySelectorAll('#tlc-panel .tlc-table tbody tr td:nth-child(2)')]
+    .map((td) => { const a = td.querySelector('a'); return { text: td.textContent, href: a ? a.getAttribute('href') : null }; }));
+  const cGood = ct.find((r) => r.text === 'good-blog'), cBad = ct.find((r) => r.text === 'evil.com/x');
+  ok(cGood && cGood.href === 'https://good-blog.tumblr.com', `D: count table links a valid blog (got ${JSON.stringify(cGood)})`);
+  ok(cBad && cBad.href === null, `D: count table shows invalid blog name as text only (got ${JSON.stringify(cBad)})`);
+  const cBadAll = await unsafe();
+  ok(cBadAll.length === 0, `D: still no unsafe href/src after scan + count (got ${JSON.stringify(cBadAll)})`);
+
   ok(errs.length === 0, 'D: no page errors (' + JSON.stringify(errs.slice(0, 2)) + ')');
+  await ctx.close();
+}
+
+// ---- E) out-of-order searches: only the latest request may render ----------
+// A slow query (A) followed by a fast one (B) must leave B's results only —
+// never B's header with A's rows appended under it.
+async function races(browser) {
+  const dayStart = (o) => Math.floor(Date.UTC(NOW.getUTCFullYear(), NOW.getUTCMonth(), NOW.getUTCDate() - o) / 1000);
+  const A = dayStart(20), B = dayStart(10);
+  const iso = (ts) => new Date(ts * 1000).toISOString().slice(0, 10);
+  const posts = [
+    post(6201, B + 15 * 3600, 'rb', ['tb']), post(6202, B + 12 * 3600, 'rb', ['tb']),
+    post(6101, A + 16 * 3600, 'ra', ['ta']), post(6102, A + 14 * 3600, 'ra', ['ta']), post(6103, A + 12 * 3600, 'ra', ['ta']),
+  ];
+  const ctx = await newCtx(browser, 'Europe/Rome');
+  const page = await ctx.newPage();
+  const errs = [];
+  page.on('pageerror', (e) => errs.push(String(e)));
+  await scan(page, posts);
+
+  // window.__tlcSlowNext = ms → the NEXT getAll() delivers its result that late.
+  await page.evaluate(() => {
+    window.__tlcSlowNext = 0;
+    const desc = Object.getOwnPropertyDescriptor(IDBRequest.prototype, 'onsuccess');
+    for (const P of [IDBIndex.prototype, IDBObjectStore.prototype]) {
+      const orig = P.getAll;
+      P.getAll = function (...a) {
+        const req = orig.apply(this, a);
+        const d = window.__tlcSlowNext;
+        if (d) {
+          window.__tlcSlowNext = 0;
+          Object.defineProperty(req, 'onsuccess', { configurable: true,
+            get() { return desc.get.call(req); },
+            set(fn) { desc.set.call(req, (e) => setTimeout(() => fn.call(req, e), d)); } });
+        }
+        return req;
+      };
+    }
+    const input = document.querySelector('input[placeholder^="Search likes"]');
+    window.__tlcSearch = (q) => { input.value = q; input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })); };
+    window.__tlcDay = (key) => { const c = [...document.querySelectorAll('#tlc-panel .tlc-grid .tlc-cell')].find((x) => (x.title || '').startsWith(key + ' ')); if (!c) throw new Error('no cell ' + key); c.click(); };
+  });
+
+  const state = () => page.evaluate(() => ({
+    headers: [...document.querySelectorAll('#tlc-panel .tlc-sub')].filter((e) => e.offsetParent && /like/.test(e.textContent) && !/likes total/.test(e.textContent)).map((e) => e.textContent),
+    blogs: [...document.querySelectorAll('#tlc-panel .tlc-result .tlc-rblog')].map((e) => e.textContent),
+  }));
+  const scenarios = [
+    ['day A (slow) → day B', `__tlcDay(${JSON.stringify(iso(A))})`, `__tlcDay(${JSON.stringify(iso(B))})`],
+    ['blog:ra (slow) → blog:rb', '__tlcSearch("blog:ra")', '__tlcSearch("blog:rb")'],
+    ['tag ta (slow) → tag tb', '__tlcSearch("ta")', '__tlcSearch("tb")'],
+    ['tag ta (slow) → day B', '__tlcSearch("ta")', `__tlcDay(${JSON.stringify(iso(B))})`],
+    ['day A (slow) → blog:rb', `__tlcDay(${JSON.stringify(iso(A))})`, '__tlcSearch("blog:rb")'],
+  ];
+  for (const [name, first, second] of scenarios) {
+    await page.evaluate(`window.__tlcSlowNext = 600; ${first}; ${second};`);
+    await page.waitForTimeout(1100);
+    const s = await state();
+    ok(s.blogs.length === 2 && s.blogs.every((b) => b === 'rb'),
+      `E: ${name} — only B's 2 likes shown (got ${JSON.stringify(s.blogs)})`);
+    ok(s.headers.length === 1 && /^2 likes/.test(s.headers[0]),
+      `E: ${name} — one header, for B (got ${JSON.stringify(s.headers)})`);
+  }
+  ok(errs.length === 0, 'E: no page errors (' + JSON.stringify(errs.slice(0, 2)) + ')');
   await ctx.close();
 }
 
@@ -386,6 +502,7 @@ async function urlSafety(browser) {
     await functional(browser);
     await bigGallery(browser);
     await urlSafety(browser);
+    await races(browser);
     await dst(browser);
   } finally {
     await browser.close();
