@@ -1395,13 +1395,19 @@
     updateRailActive();
   }
 
+  // Each call takes a generation number; after the await, a call that is no
+  // longer the latest returns without touching galleryItems, the note or the DOM
+  // (a slow "all likes" load must not overwrite a newer, faster blog: filter).
   async function renderLikesGallery() {
+    const gen = ++galleryGen;
+    const filter = galleryFilter;       // the filter THIS call renders
     clearGalleryPool();
     gallerySpacer.innerHTML = '';
     let items;
     try {
-      items = await loadGalleryData(galleryFilter);
+      items = await loadGalleryData(filter);
     } catch (err) {
+      if (gen !== galleryGen) return;
       galleryNote.className = 'tlc-err';
       galleryNote.textContent = 'Gallery error: ' + (err && err.message ? err.message : String(err));
       galleryItems = [];
@@ -1409,20 +1415,21 @@
       galleryRail.innerHTML = '';
       return;
     }
+    if (gen !== galleryGen) return;     // a newer filter took over
     galleryNote.className = 'tlc-sub';
     galleryItems = items;
 
     if (!items.length) {
       gallerySpacer.style.height = '0px';
       galleryRail.innerHTML = '';
-      galleryNote.textContent = galleryFilter
-        ? `No liked images match “${galleryFilter}”.`
+      galleryNote.textContent = filter
+        ? `No liked images match “${filter}”.`
         : 'No liked posts with images yet. Press “Refresh likes”.';
       return;
     }
 
-    galleryNote.textContent = galleryFilter
-      ? `${items.length} liked image${items.length === 1 ? '' : 's'} matching “${galleryFilter}”.`
+    galleryNote.textContent = filter
+      ? `${items.length} liked image${items.length === 1 ? '' : 's'} matching “${filter}”.`
       : `${items.length} liked image${items.length === 1 ? '' : 's'} — scroll freely; jump by year on the right.`;
 
     galleryScroller.scrollTop = 0;
@@ -1478,6 +1485,7 @@
 
   async function doFollowedSearch(tag) {
     const q = normTag(tag);
+    const seq = ++followedSearchSeq;
     fSearchInput.value = tag;
     fBlogListBox.style.display = 'none';
     fResultsBox.style.display = 'block';
@@ -1502,10 +1510,12 @@
     try {
       matches = await followedByTag(q);
     } catch (err) {
+      if (seq !== followedSearchSeq) return;
       header.className = 'tlc-err';
       header.textContent = 'Search error: ' + (err && err.message ? err.message : String(err));
       return;
     }
+    if (seq !== followedSearchSeq) return;   // a newer search / count took over
 
     header.textContent = matches.length
       ? `${matches.length} post${matches.length === 1 ? '' : 's'} tagged “${q}”`
@@ -1514,6 +1524,7 @@
     if (!matches.length) {
       try {
         const all = await distinctFollowedTags();
+        if (seq !== followedSearchSeq) return;
         const near = all.filter((t) => t.includes(q)).slice(0, 30);
         if (near.length) {
           const sug = document.createElement('div');
@@ -1704,6 +1715,7 @@
     scanRunning = true;
     scanStopRequested = false;
     setScanButtonsState();
+    followedSearchSeq++;   // drop any followed search still in flight
     fBlogListBox.style.display = 'none';
     fResultsBox.style.display = 'block';
     fResultsBox.innerHTML = '';
@@ -1825,6 +1837,7 @@
   let browseMode = 'calendar';          // 'calendar' | 'gallery'
   // virtualized gallery elements + state
   let galleryFilterInput, galleryNote, galleryScroller, gallerySpacer, galleryRail, galleryRO;
+  let galleryGen = 0;                   // bumped by every renderLikesGallery() call
   let galleryItems = [];                 // [{img, blog, ts, url}] newest-first
   let galleryFilter = '';                // '', a tag, or 'blog:name'
   let galleryCols = 0, galleryColW = 0, galleryRowH = 0;
@@ -1840,6 +1853,9 @@
   // same resultsBox, so after each await a search checks it is still the
   // latest one and quietly drops its results otherwise.
   let likesSearchSeq = 0;
+  // Same idea for the Followed blogs tab (fResultsBox): followed searches and
+  // the "Count posts" table both bump it, so a slow search never lands late.
+  let followedSearchSeq = 0;
   let currentMeta = null;
   let viewMode = 'calendar';
   // followed state

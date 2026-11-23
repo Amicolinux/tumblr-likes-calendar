@@ -431,24 +431,9 @@ async function urlSafety(browser) {
   await ctx.close();
 }
 
-// ---- E) out-of-order searches: only the latest request may render ----------
-// A slow query (A) followed by a fast one (B) must leave B's results only —
-// never B's header with A's rows appended under it.
-async function races(browser) {
-  const dayStart = (o) => Math.floor(Date.UTC(NOW.getUTCFullYear(), NOW.getUTCMonth(), NOW.getUTCDate() - o) / 1000);
-  const A = dayStart(20), B = dayStart(10);
-  const iso = (ts) => new Date(ts * 1000).toISOString().slice(0, 10);
-  const posts = [
-    post(6201, B + 15 * 3600, 'rb', ['tb']), post(6202, B + 12 * 3600, 'rb', ['tb']),
-    post(6101, A + 16 * 3600, 'ra', ['ta']), post(6102, A + 14 * 3600, 'ra', ['ta']), post(6103, A + 12 * 3600, 'ra', ['ta']),
-  ];
-  const ctx = await newCtx(browser, 'Europe/Rome');
-  const page = await ctx.newPage();
-  const errs = [];
-  page.on('pageerror', (e) => errs.push(String(e)));
-  await scan(page, posts);
-
-  // window.__tlcSlowNext = ms → the NEXT getAll() delivers its result that late.
+// window.__tlcSlowNext = ms → the NEXT getAll() (store or index) delivers its
+// result that late: a deterministic "slow query" for the race tests.
+async function installSlowGetAll(page) {
   await page.evaluate(() => {
     window.__tlcSlowNext = 0;
     const desc = Object.getOwnPropertyDescriptor(IDBRequest.prototype, 'onsuccess');
@@ -466,6 +451,28 @@ async function races(browser) {
         return req;
       };
     }
+  });
+}
+
+// ---- E) out-of-order searches: only the latest request may render ----------
+// A slow query (A) followed by a fast one (B) must leave B's results only —
+// never B's header with A's rows appended under it.
+async function races(browser) {
+  const dayStart = (o) => Math.floor(Date.UTC(NOW.getUTCFullYear(), NOW.getUTCMonth(), NOW.getUTCDate() - o) / 1000);
+  const A = dayStart(20), B = dayStart(10);
+  const iso = (ts) => new Date(ts * 1000).toISOString().slice(0, 10);
+  const posts = [
+    post(6201, B + 15 * 3600, 'rb', ['tb']), post(6202, B + 12 * 3600, 'rb', ['tb']),
+    post(6101, A + 16 * 3600, 'ra', ['ta']), post(6102, A + 14 * 3600, 'ra', ['ta']), post(6103, A + 12 * 3600, 'ra', ['ta']),
+  ];
+  const ctx = await newCtx(browser, 'Europe/Rome');
+  const page = await ctx.newPage();
+  const errs = [];
+  page.on('pageerror', (e) => errs.push(String(e)));
+  await scan(page, posts, PAGE, [{ name: 'rf1' }, { name: 'rf2' }]);
+
+  await installSlowGetAll(page);
+  await page.evaluate(() => {
     const input = document.querySelector('input[placeholder^="Search likes"]');
     window.__tlcSearch = (q) => { input.value = q; input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })); };
     window.__tlcDay = (key) => { const c = [...document.querySelectorAll('#tlc-panel .tlc-grid .tlc-cell')].find((x) => (x.title || '').startsWith(key + ' ')); if (!c) throw new Error('no cell ' + key); c.click(); };
@@ -491,7 +498,94 @@ async function races(browser) {
     ok(s.headers.length === 1 && /^2 likes/.test(s.headers[0]),
       `E: ${name} — one header, for B (got ${JSON.stringify(s.headers)})`);
   }
+
+  // Same race on the "Followed blogs" tab (doFollowedSearch → fResultsBox).
+  const base = Math.floor(NOW.getTime() / 1000) - 3600;
+  const frecs = [];
+  for (let i = 0; i < 3; i++) frecs.push({ key: 'fa-blog:' + (6300 + i), id: String(6300 + i), blog: 'fa-blog', ts: base - i * 60, tags: ['fa'], tagsRaw: ['fa'], images: [`https://img.example/${6300 + i}.jpg`], postUrl: `https://fa-blog.tumblr.com/post/${6300 + i}` });
+  for (let i = 0; i < 2; i++) frecs.push({ key: 'fb-blog:' + (6400 + i), id: String(6400 + i), blog: 'fb-blog', ts: base - i * 60, tags: ['fb'], tagsRaw: ['fb'], images: [`https://img.example/${6400 + i}.jpg`], postUrl: `https://fb-blog.tumblr.com/post/${6400 + i}` });
+  await page.evaluate((recs) => new Promise((resolve, reject) => {
+    const rq = indexedDB.open('TumblrLikesCalendar');
+    rq.onerror = () => reject(rq.error);
+    rq.onsuccess = () => {
+      const tx = rq.result.transaction('followed', 'readwrite');
+      for (const r of recs) tx.objectStore('followed').put(r);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    };
+  }), frecs);
+  await page.click('button:has-text("Followed blogs")');
+  await page.waitForFunction(() => /2 followed blogs/.test(document.body.textContent), null, { timeout: 8000 });
+  await page.waitForTimeout(300);   // let the tab's own IndexedDB reads settle
+  await page.evaluate(() => {
+    const input = document.querySelector('input[placeholder^="Search downloaded posts"]');
+    window.__tlcFSearch = (q) => { input.value = q; input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })); };
+    window.__tlcCount = () => [...document.querySelectorAll('#tlc-panel button')].find((b) => b.textContent === 'Count posts').click();
+  });
+  const fstate = () => page.evaluate(() => {
+    const vis = (e) => !!e.offsetParent;
+    return {
+      headers: [...document.querySelectorAll('#tlc-panel .tlc-sub')].filter((e) => vis(e) && /posts? tagged/.test(e.textContent)).map((e) => e.textContent),
+      blogs: [...document.querySelectorAll('#tlc-panel .tlc-grid-imgs .tlc-gi-blog')].filter(vis).map((e) => e.textContent),
+      tableRows: [...document.querySelectorAll('#tlc-panel .tlc-table tbody tr')].filter(vis).length,
+    };
+  });
+
+  await page.evaluate('window.__tlcSlowNext = 1500; __tlcFSearch("fa"); __tlcFSearch("fb");');
+  await page.waitForTimeout(2000);
+  let fs1 = await fstate();
+  ok(fs1.blogs.length === 2 && fs1.blogs.every((b) => b === 'fb-blog'),
+    `E: followed tag fa (slow) → tag fb — only fb's 2 posts shown (got ${JSON.stringify(fs1.blogs)})`);
+  ok(fs1.headers.length === 1 && /^2 posts tagged/.test(fs1.headers[0]),
+    `E: followed tag fa (slow) → tag fb — one header, for fb (got ${JSON.stringify(fs1.headers)})`);
+
+  await page.evaluate('window.__tlcSlowNext = 1500; __tlcFSearch("fa"); __tlcCount();');
+  await page.waitForTimeout(2000);
+  fs1 = await fstate();
+  ok(fs1.tableRows === 2 && fs1.blogs.length === 0 && fs1.headers.length === 0,
+    `E: followed tag fa (slow) → Count posts — count table only (got ${JSON.stringify(fs1)})`);
+
   ok(errs.length === 0, 'E: no page errors (' + JSON.stringify(errs.slice(0, 2)) + ')');
+  await ctx.close();
+}
+
+// ---- F) gallery: a slow load must not overwrite a newer filter's results ----
+async function galleryRace(browser) {
+  const base = Math.floor(NOW.getTime() / 1000) - 3600;
+  const posts = [
+    post(6501, base, 'gb', ['x']), post(6502, base - 60, 'gb', ['x']),
+    post(6601, base - 120, 'ga', ['x']), post(6602, base - 180, 'ga', ['x']), post(6603, base - 240, 'ga', ['x']),
+  ];
+  const ctx = await newCtx(browser, 'Europe/Rome');
+  const page = await ctx.newPage();
+  const errs = [];
+  page.on('pageerror', (e) => errs.push(String(e)));
+  await scan(page, posts);
+  await page.click('button:has-text("Gallery")');
+  await page.waitForFunction(() => /^5 liked images/.test(document.getElementById('tlc-gallery-note').textContent), null, { timeout: 8000 });
+  await installSlowGetAll(page);
+  await page.evaluate(() => {
+    const input = document.querySelector('.tlc-gallery-bar input');
+    window.__tlcGal = (q) => { input.value = q; input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })); };
+  });
+  const gstate = () => page.evaluate(() => ({
+    note: document.getElementById('tlc-gallery-note').textContent,
+    input: document.querySelector('.tlc-gallery-bar input').value,
+    blogs: [...document.querySelectorAll('.tlc-gi-abs .tlc-gi-blog')].map((e) => e.textContent).sort(),
+  }));
+  const scenarios = [
+    ['blog:ga (slow) → blog:gb', 'blog:ga', 'blog:gb', /^2 liked images matching “blog:gb”/, ['gb', 'gb']],
+    ['all (slow) → blog:gb', '', 'blog:gb', /^2 liked images matching “blog:gb”/, ['gb', 'gb']],
+    ['blog:ga (slow) → Clear', 'blog:ga', '', /^5 liked images — scroll freely/, ['ga', 'ga', 'ga', 'gb', 'gb']],
+  ];
+  for (const [name, first, second, noteRe, blogs] of scenarios) {
+    await page.evaluate(([a, b]) => { window.__tlcSlowNext = 600; window.__tlcGal(a); window.__tlcGal(b); }, [first, second]);
+    await page.waitForTimeout(1100);
+    const g = await gstate();
+    ok(noteRe.test(g.note), `F: ${name} — note matches the latest filter (got "${g.note}", input "${g.input}")`);
+    ok(JSON.stringify(g.blogs) === JSON.stringify(blogs), `F: ${name} — grid shows the latest filter's images (got ${JSON.stringify(g.blogs)})`);
+  }
+  ok(errs.length === 0, 'F: no page errors (' + JSON.stringify(errs.slice(0, 2)) + ')');
   await ctx.close();
 }
 
@@ -503,6 +597,7 @@ async function races(browser) {
     await bigGallery(browser);
     await urlSafety(browser);
     await races(browser);
+    await galleryRace(browser);
     await dst(browser);
   } finally {
     await browser.close();
