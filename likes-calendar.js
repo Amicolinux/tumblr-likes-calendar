@@ -86,6 +86,7 @@
   // https://<blog>.tumblr.com[path] only for a plain Tumblr blog name: a name
   // like "evil.com/x" would otherwise move the link to another host. '' if not.
   const BLOG_NAME_RE = /^[a-z0-9-]+$/i;
+  const BLOG_PREFIX_HINT = 'Type a blog name after “blog:”, e.g. blog:staff (blog names are case-sensitive).';
   const blogUrl = (blog, path = '') =>
     (typeof blog === 'string' && BLOG_NAME_RE.test(blog)) ? `https://${blog}.tumblr.com${path}` : '';
 
@@ -944,11 +945,11 @@
     const tagsWrap = document.createElement('div');
     tagsWrap.className = 'tlc-rtags';
     const show = (rec.tagsRaw && rec.tagsRaw.length) ? rec.tagsRaw : rec.tags;
-    show.slice(0, 12).forEach((t, i) => {
+    show.slice(0, 12).forEach((t) => {
       const el = document.createElement('span');
       el.className = 'tlc-rtag';
       el.textContent = '#' + t;
-      el.addEventListener('click', () => doSearch(rec.tags[i] || t));
+      el.addEventListener('click', () => doTagSearch(t));   // normalized inside
       tagsWrap.appendChild(el);
     });
     meta.appendChild(tagsWrap);
@@ -956,10 +957,17 @@
     return row;
   }
 
-  async function doSearch(tag) {
-    const raw = String(tag == null ? '' : tag).trim();
-    const bm = /^blog:\s*(.+)$/i.exec(raw);
-    if (bm) { return doBlogSearch(bm[1].trim()); }
+  // Search box entry point: "blog:name" (even a bare "blog:") is a blog search,
+  // anything else a tag search. Tag chips call doTagSearch() directly, so a tag
+  // that literally starts with "blog:" is still searched as a tag.
+  async function doSearch(input) {
+    const raw = String(input == null ? '' : input).trim();
+    const bm = /^blog:\s*(.*)$/i.exec(raw);
+    if (bm) { return doBlogSearch(bm[1].trim(), true); }
+    return doTagSearch(input);
+  }
+
+  async function doTagSearch(tag) {
     const q = normTag(tag);
     const seq = ++likesSearchSeq;
     searchInput.value = tag;
@@ -1034,7 +1042,9 @@
     }
   }
 
-  async function doBlogSearch(blog) {
+  // fromPrefix: the user typed "blog:" — with no name we show a hint instead of
+  // silently going back to the calendar.
+  async function doBlogSearch(blog, fromPrefix = false) {
     const name = String(blog == null ? '' : blog).trim();
     const seq = ++likesSearchSeq;
     searchInput.value = name ? ('blog:' + name) : '';
@@ -1054,11 +1064,16 @@
     bar.appendChild(back);
     resultsBox.appendChild(bar);
 
-    if (!name) { showBrowse(); return; }
+    if (!name && !fromPrefix) { showBrowse(); return; }
 
     const header = document.createElement('div');
     header.className = 'tlc-sub';
     resultsBox.appendChild(header);
+    if (!name) {
+      searchInput.value = 'blog:';
+      header.textContent = BLOG_PREFIX_HINT;
+      return;
+    }
 
     let matches = [];
     try {
@@ -1169,7 +1184,7 @@
       cnt.textContent = n;
       chip.appendChild(cnt);
     }
-    chip.addEventListener('click', () => doSearch(tag));
+    chip.addEventListener('click', () => doTagSearch(tag));
     return chip;
   }
 
@@ -1191,6 +1206,10 @@
     resultsBox.style.display = 'none';
     resultsBox.innerHTML = '';
     const gal = (browseMode === 'gallery');
+    // Button highlight follows browseMode here, so every path that switches
+    // mode (setBrowseMode, openPanel, runFetch) keeps it in sync.
+    if (calBtn) calBtn.classList.toggle('tlc-primary', !gal);
+    if (galBtn) galBtn.classList.toggle('tlc-primary', gal);
     // In gallery mode the gallery has its own filter box, so hide the heatmap's
     // search field and the top-tags chips to keep the view uncluttered.
     if (searchWrap) searchWrap.style.display = gal ? 'none' : 'flex';
@@ -1201,8 +1220,6 @@
 
   async function setBrowseMode(mode) {
     browseMode = mode;
-    if (calBtn) calBtn.classList.toggle('tlc-primary', mode === 'calendar');
-    if (galBtn) galBtn.classList.toggle('tlc-primary', mode === 'gallery');
     showBrowse();                       // make the gallery visible BEFORE measuring it
     if (mode === 'gallery') await renderLikesGallery();
   }
@@ -1222,9 +1239,9 @@
 
   async function loadGalleryData(filter) {
     const f = String(filter == null ? '' : filter).trim();
-    const bm = /^blog:\s*(.+)$/i.exec(f);
+    const bm = /^blog:\s*(.*)$/i.exec(f);
     let recs;
-    if (bm) recs = await postsByBlog(bm[1].trim());
+    if (bm) recs = bm[1].trim() ? await postsByBlog(bm[1].trim()) : [];
     else if (f) recs = await postsByTag(f);
     else recs = await likesWithImages(Infinity);   // all likes with images, newest-first
     const out = [];
@@ -1422,7 +1439,9 @@
     if (!items.length) {
       gallerySpacer.style.height = '0px';
       galleryRail.innerHTML = '';
-      galleryNote.textContent = filter
+      galleryNote.textContent = /^blog:\s*$/i.test(filter)
+        ? BLOG_PREFIX_HINT
+        : filter
         ? `No liked images match “${filter}”.`
         : 'No liked posts with images yet. Press “Refresh likes”.';
       return;

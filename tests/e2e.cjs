@@ -589,6 +589,92 @@ async function galleryRace(browser) {
   await ctx.close();
 }
 
+// ---- G) minor fixes: button state, bare "blog:", tag chip click ------------
+async function minors(browser) {
+  const base = Math.floor(NOW.getTime() / 1000) - 3600;
+  const posts = [
+    post(6701, base, 'gblog', ['cats']),
+    post(6702, base - 60, 'gblog', ['dogs']),
+    post(6703, base - 120, 'wblog', ['blog:weird']),
+  ];
+  const ctx = await newCtx(browser, 'Europe/Rome');
+  const page = await ctx.newPage();
+  const errs = [];
+  page.on('pageerror', (e) => errs.push(String(e)));
+  await scan(page, posts);
+  const btns = () => page.evaluate(() => {
+    const b = (t) => [...document.querySelectorAll('#tlc-panel button')].find((x) => x.textContent === t);
+    return { heat: b('📅 Heatmap').classList.contains('tlc-primary'), gal: b('🖼 Gallery').classList.contains('tlc-primary'),
+      galleryVisible: !!document.querySelector('.tlc-gallery-scroller') && !!document.querySelector('.tlc-gallery-scroller').offsetParent };
+  });
+
+  // 5a) Gallery → Close → reopen: heatmap shown, so only "Heatmap" is active.
+  await page.click('button:has-text("Gallery")');
+  await page.waitForFunction(() => document.querySelectorAll('.tlc-gi-abs').length > 0, null, { timeout: 8000 });
+  await page.click('#tlc-panel button:has-text("Close")');
+  await page.click('#tlc-launcher');
+  await page.waitForTimeout(200);
+  let b = await btns();
+  ok(!b.galleryVisible && b.heat && !b.gal, `G: after reopen, heatmap shown and only Heatmap active (got ${JSON.stringify(b)})`);
+  // ... and Gallery → Refresh likes.
+  await page.click('button:has-text("Gallery")');
+  await page.waitForFunction(() => document.querySelectorAll('.tlc-gi-abs').length > 0, null, { timeout: 8000 });
+  await page.click('button:has-text("Refresh likes")');
+  await page.waitForFunction(() => { const s = document.querySelector('#tlc-panel .tlc-sub'); return s && /likes total/.test(s.textContent); }, null, { timeout: 20000 });
+  b = await btns();
+  ok(!b.galleryVisible && b.heat && !b.gal, `G: after Refresh, heatmap shown and only Heatmap active (got ${JSON.stringify(b)})`);
+
+  // Legacy-style record whose tags/tagsRaw are not index-aligned.
+  await page.evaluate((rec) => new Promise((resolve, reject) => {
+    const rq = indexedDB.open('TumblrLikesCalendar');
+    rq.onsuccess = () => {
+      const tx = rq.result.transaction('posts', 'readwrite');
+      tx.objectStore('posts').put(rec);
+      tx.oncomplete = () => resolve(); tx.onerror = () => reject(tx.error);
+    };
+  }), { key: 'old:6801', id: '6801', blog: 'old', ts: base - 600, tags: ['cats', 'dogs'], tagsRaw: ['Dogs', 'Cats'],
+    images: ['https://img.example/6801.jpg'], postUrl: 'https://old.tumblr.com/post/6801', summary: '' });
+
+  const search = async (q) => {
+    await page.fill('input[placeholder^="Search likes"]', q);
+    await page.press('input[placeholder^="Search likes"]', 'Enter');
+    await page.waitForTimeout(400);
+  };
+  const subs = () => page.evaluate(() => [...document.querySelectorAll('#tlc-panel .tlc-sub')].filter((e) => e.offsetParent && !/likes total/.test(e.textContent)).map((e) => e.textContent));
+
+  // 5b) bare "blog:" → a hint, not a tag search for the literal "blog:".
+  await search('blog:');
+  let t = await subs();
+  ok(t.some((x) => /blog name/i.test(x)) && !t.some((x) => /tagged/.test(x)), `G: bare "blog:" in search shows a hint (got ${JSON.stringify(t)})`);
+  await page.evaluate(() => { const bk = document.querySelector('#tlc-panel .tlc-back'); if (bk) bk.click(); });
+  await page.click('button:has-text("Gallery")');
+  await page.waitForFunction(() => document.querySelectorAll('.tlc-gi-abs').length > 0, null, { timeout: 8000 });
+  await page.fill('.tlc-gallery-bar input', 'blog:');
+  await page.press('.tlc-gallery-bar input', 'Enter');
+  await page.waitForTimeout(400);
+  const note = await page.evaluate(() => document.getElementById('tlc-gallery-note').textContent);
+  ok(/blog name/i.test(note) && !/No liked images match/.test(note), `G: bare "blog:" in gallery filter shows a hint (got "${note}")`);
+  await page.click('button:has-text("Heatmap")');
+
+  // 5c) clicking a displayed tag searches THAT tag.
+  await search('cats');
+  await page.evaluate(() => {
+    const row = [...document.querySelectorAll('#tlc-panel .tlc-result')].find((r) => r.querySelector('.tlc-rblog').textContent === 'old');
+    [...row.querySelectorAll('.tlc-rtag')].find((e) => e.textContent === '#Dogs').click();
+  });
+  await page.waitForTimeout(400);
+  t = await subs();
+  ok(t.some((x) => /tagged “dogs”/.test(x)), `G: clicking #Dogs searches "dogs" (got ${JSON.stringify(t)})`);
+  await search('blog:wblog');
+  await page.evaluate(() => [...document.querySelectorAll('#tlc-panel .tlc-rtag')].find((e) => e.textContent === '#blog:weird').click());
+  await page.waitForTimeout(400);
+  t = await subs();
+  ok(t.some((x) => /1 like tagged “blog:weird”/.test(x)), `G: clicking tag #blog:weird is a tag search, not a blog search (got ${JSON.stringify(t)})`);
+
+  ok(errs.length === 0, 'G: no page errors (' + JSON.stringify(errs.slice(0, 2)) + ')');
+  await ctx.close();
+}
+
 (async () => {
   console.log(`Simulated today: ${NOW.toISOString().slice(0, 10)}${process.env.TLC_TODAY ? ' (TLC_TODAY)' : ''}`);
   const browser = await chromium.launch({ headless: true });
@@ -598,6 +684,7 @@ async function galleryRace(browser) {
     await urlSafety(browser);
     await races(browser);
     await galleryRace(browser);
+    await minors(browser);
     await dst(browser);
   } finally {
     await browser.close();
