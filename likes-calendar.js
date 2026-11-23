@@ -75,6 +75,14 @@
   const pad = (n) => String(n).padStart(2, '0');
   const dayKey = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
   const normTag = (t) => String(t == null ? '' : t).trim().toLowerCase();
+  // The ONLY gate for Tumblr-supplied URLs before they reach href/src (trap #5):
+  // http(s) or protocol-relative "//host/..." pass; javascript:, data:, relative
+  // paths, non-strings → ''. Callers skip the attribute when it returns ''.
+  const SAFE_URL_RE = /^(https?:)?\/\//i;
+  const safeUrl = (u) => {
+    const s = typeof u === 'string' ? u.trim() : '';
+    return SAFE_URL_RE.test(s) ? s : '';
+  };
 
   // ---- IndexedDB layer ----------------------------------------------------
   let _dbPromise = null;
@@ -878,11 +886,12 @@
   function renderResult(rec) {
     const row = document.createElement('div');
     row.className = 'tlc-result';
-    if (rec.images && rec.images.length) {
+    const thumbUrl = rec.images && rec.images.length ? safeUrl(rec.images[0]) : '';
+    if (thumbUrl) {
       const img = document.createElement('img');
       img.className = 'tlc-thumb';
       img.loading = 'lazy';
-      img.src = rec.images[0];
+      img.src = thumbUrl;
       img.alt = '';
       img.addEventListener('error', () => {
         const ph = document.createElement('div');
@@ -909,13 +918,17 @@
     const date = document.createElement('span');
     date.className = 'tlc-rdate';
     date.textContent = fmtDate(rec.ts);
-    const open = document.createElement('a');
-    open.className = 'tlc-btn tlc-ropen';
-    open.textContent = 'Open';
-    open.href = rec.postUrl;
-    open.target = '_blank';
-    open.rel = 'noopener';
-    top.append(blog, date, open);
+    top.append(blog, date);
+    const postHref = safeUrl(rec.postUrl);
+    if (postHref) {
+      const open = document.createElement('a');
+      open.className = 'tlc-btn tlc-ropen';
+      open.textContent = 'Open';
+      open.href = postHref;
+      open.target = '_blank';
+      open.rel = 'noopener';
+      top.appendChild(open);
+    }
     meta.appendChild(top);
     if (rec.summary) {
       const sum = document.createElement('div');
@@ -1201,9 +1214,10 @@
     else recs = await likesWithImages(Infinity);   // all likes with images, newest-first
     const out = [];
     for (const r of recs) {
-      if (r && r.images && r.images.length) {
-        out.push({ img: r.images[0], blog: r.blog, ts: r.ts || 0, url: r.postUrl });
-      }
+      // Skip unusable images here so the virtualized layout never has holes;
+      // an unsafe postUrl just leaves the cell without a link.
+      const img = r && r.images && r.images.length ? safeUrl(r.images[0]) : '';
+      if (img) out.push({ img, blog: r.blog, ts: r.ts || 0, url: safeUrl(r.postUrl) });
     }
     return out;
   }
@@ -1235,13 +1249,16 @@
     a.style.height = galleryColW + 'px';
     a.style.left = (col * (galleryColW + GAL_GAP)) + 'px';
     a.style.top = (row * galleryRowH) + 'px';
-    a.href = item.url;
-    a.target = '_blank';
-    a.rel = 'noopener';
+    const href = safeUrl(item.url);
+    if (href) {
+      a.href = href;
+      a.target = '_blank';
+      a.rel = 'noopener';
+    }
     a.title = item.blog + (item.ts ? ' — ' + fmtDate(item.ts) : '');
     const img = document.createElement('img');
     img.loading = 'lazy';
-    img.src = item.img;
+    img.src = safeUrl(item.img);   // already filtered in loadGalleryData
     img.alt = '';
     img.addEventListener('error', () => { a.style.visibility = 'hidden'; });
     const cap = document.createElement('span');
@@ -1419,15 +1436,20 @@
     grid.className = 'tlc-grid-imgs';
     const shown = matches.slice(0, FOLLOWED_RESULT_LIMIT);
     for (const rec of shown) {
+      const imgUrl = rec.images && rec.images.length ? safeUrl(rec.images[0]) : '';
+      if (!imgUrl) continue;   // nothing safe to show
       const a = document.createElement('a');
       a.className = 'tlc-gi';
-      a.href = rec.postUrl;
-      a.target = '_blank';
-      a.rel = 'noopener';
+      const href = safeUrl(rec.postUrl);
+      if (href) {
+        a.href = href;
+        a.target = '_blank';
+        a.rel = 'noopener';
+      }
       a.title = rec.blog + (rec.ts ? ' — ' + fmtDate(rec.ts) : '');
       const img = document.createElement('img');
       img.loading = 'lazy';
-      img.src = rec.images[0];
+      img.src = imgUrl;
       img.alt = '';
       img.addEventListener('error', () => { a.style.display = 'none'; });
       const cap = document.createElement('span');
@@ -1748,9 +1770,12 @@
         td0.textContent = String(idx + 1);
         const td1 = document.createElement('td');
         const a = document.createElement('a');
-        a.href = 'https://' + r.blog + '.tumblr.com';
-        a.target = '_blank';
-        a.rel = 'noopener';
+        const blogHref = safeUrl('https://' + r.blog + '.tumblr.com');
+        if (blogHref) {
+          a.href = blogHref;
+          a.target = '_blank';
+          a.rel = 'noopener';
+        }
         a.textContent = r.blog;
         td1.appendChild(a);
         const td2 = document.createElement('td');

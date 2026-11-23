@@ -280,12 +280,112 @@ async function bigGallery(browser) {
   await ctx.close();
 }
 
+// ---- D) external URLs are validated before href/src (trap #5) ---------------
+// javascript:/data: must never reach an href/src; protocol-relative //host/...
+// URLs must keep working.
+async function urlSafety(browser) {
+  const SAFE = /^(https?:)?\/\//i;
+  const base = Math.floor(NOW.getTime() / 1000) - 3600;
+  const evilLink = post(7001, base, 'evil', ['xss']);
+  evilLink.postUrl = 'javascript:alert(1)';
+  const evilImg = post(7002, base - 60, 'evil', ['xss']);
+  evilImg.content = [{ type: 'image', media: [{ url: 'javascript:alert(2)', width: 500 }] }];
+  const dataImg = post(7003, base - 120, 'evil', ['xss']);
+  dataImg.content = [{ type: 'image', media: [{ url: 'data:image/gif;base64,R0lGODlhAQABAAAAACw=', width: 500 }] }];
+  const protoRel = post(7004, base - 180, 'proto', ['xss']);
+  protoRel.postUrl = '//proto.tumblr.com/post/7004';
+  protoRel.content = [{ type: 'image', media: [{ url: '//img.example/7004.jpg', width: 500 }] }];
+  const posts = [evilLink, evilImg, dataImg, protoRel];
+
+  const ctx = await newCtx(browser, 'Europe/Rome');
+  const page = await ctx.newPage();
+  const errs = [];
+  page.on('pageerror', (e) => errs.push(String(e)));
+  await scan(page, posts);
+
+  // Every href/src inside the panel that is currently rendered.
+  const unsafe = () => page.evaluate((src) => {
+    const re = new RegExp(src, 'i');
+    const bad = [];
+    for (const el of document.querySelectorAll('#tlc-panel [href], #tlc-panel [src]')) {
+      for (const at of ['href', 'src']) {
+        const v = el.getAttribute(at);
+        if (v != null && !re.test(v)) bad.push(at + '=' + v);
+      }
+    }
+    return bad;
+  }, SAFE.source);
+
+  // 1) tag search results (renderResult)
+  await page.fill('input[placeholder^="Search likes"]', 'xss');
+  await page.press('input[placeholder^="Search likes"]', 'Enter');
+  await page.waitForFunction(() => document.querySelectorAll('#tlc-panel .tlc-result').length === 4, null, { timeout: 8000 });
+  const sr = await page.evaluate(() => ({
+    opens: [...document.querySelectorAll('#tlc-panel .tlc-result a.tlc-ropen')].map((a) => a.getAttribute('href')),
+  }));
+  const sBad = await unsafe();
+  ok(sBad.length === 0, `D: search results have no unsafe href/src (got ${JSON.stringify(sBad)})`);
+  ok(!sr.opens.includes('javascript:alert(1)'), `D: javascript: postUrl is not an "Open" link (got ${JSON.stringify(sr.opens)})`);
+  ok(sr.opens.includes('//proto.tumblr.com/post/7004'), `D: protocol-relative postUrl stays a link (got ${JSON.stringify(sr.opens)})`);
+
+  // 2) gallery (buildGalleryCell)
+  await page.evaluate(() => { const b = document.querySelector('#tlc-panel .tlc-back'); if (b) b.click(); });
+  await page.click('button:has-text("Gallery")');
+  await page.waitForFunction(() => document.querySelectorAll('.tlc-gi-abs').length > 0, null, { timeout: 8000 });
+  await page.waitForTimeout(150);
+  const g = await page.evaluate(() => {
+    const cells = [...document.querySelectorAll('.tlc-gi-abs')];
+    const cellOf = (id) => cells.find((c) => { const i = c.querySelector('img'); return i && (i.getAttribute('src') || '').includes(id); });
+    const e = cellOf('7001'), p = cellOf('7004');
+    return { evilHref: e ? e.getAttribute('href') : 'NO CELL', protoHref: p ? p.getAttribute('href') : 'NO CELL' };
+  });
+  const gBad = await unsafe();
+  ok(gBad.length === 0, `D: gallery has no unsafe href/src (got ${JSON.stringify(gBad)})`);
+  ok(g.evilHref === null, `D: gallery cell with javascript: postUrl is not a link (href=${g.evilHref})`);
+  ok(g.protoHref === '//proto.tumblr.com/post/7004', `D: gallery keeps protocol-relative link (href=${g.protoHref})`);
+
+  // 3) followed-blogs results (renderFollowedResults): seed the store directly.
+  await page.evaluate((recs) => new Promise((resolve, reject) => {
+    const rq = indexedDB.open('TumblrLikesCalendar');
+    rq.onerror = () => reject(rq.error);
+    rq.onsuccess = () => {
+      const tx = rq.result.transaction('followed', 'readwrite');
+      for (const r of recs) tx.objectStore('followed').put(r);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    };
+  }), [
+    { key: 'evil:8001', id: '8001', blog: 'evil', ts: base, tags: ['xss'], tagsRaw: ['xss'], images: ['https://img.example/8001.jpg'], postUrl: 'javascript:alert(3)' },
+    { key: 'evil:8002', id: '8002', blog: 'evil', ts: base - 60, tags: ['xss'], tagsRaw: ['xss'], images: ['javascript:alert(4)'], postUrl: 'https://evil.tumblr.com/post/8002' },
+    { key: 'proto:8003', id: '8003', blog: 'proto', ts: base - 120, tags: ['xss'], tagsRaw: ['xss'], images: ['//img.example/8003.jpg'], postUrl: '//proto.tumblr.com/post/8003' },
+  ]);
+  await page.click('button:has-text("Followed blogs")');
+  await page.fill('input[placeholder^="Search downloaded posts"]', 'xss');
+  await page.press('input[placeholder^="Search downloaded posts"]', 'Enter');
+  await page.waitForFunction(() => [...document.querySelectorAll('#tlc-panel .tlc-grid-imgs')].some((e) => e.offsetParent), null, { timeout: 8000 });
+  const f = await page.evaluate(() => {
+    const grid = [...document.querySelectorAll('#tlc-panel .tlc-grid-imgs')].find((e) => e.offsetParent);
+    const cells = [...grid.querySelectorAll('.tlc-gi')];
+    const cellOf = (id) => cells.find((c) => { const i = c.querySelector('img'); return i && (i.getAttribute('src') || '').includes(id); });
+    const e = cellOf('8001'), p = cellOf('8003');
+    return { evilHref: e ? e.getAttribute('href') : 'NO CELL', protoHref: p ? p.getAttribute('href') : 'NO CELL' };
+  });
+  const fBad = await unsafe();
+  ok(fBad.length === 0, `D: followed results have no unsafe href/src (got ${JSON.stringify(fBad)})`);
+  ok(f.evilHref === null, `D: followed cell with javascript: postUrl is not a link (href=${f.evilHref})`);
+  ok(f.protoHref === '//proto.tumblr.com/post/8003', `D: followed keeps protocol-relative link (href=${f.protoHref})`);
+
+  ok(errs.length === 0, 'D: no page errors (' + JSON.stringify(errs.slice(0, 2)) + ')');
+  await ctx.close();
+}
+
 (async () => {
   console.log(`Simulated today: ${NOW.toISOString().slice(0, 10)}${process.env.TLC_TODAY ? ' (TLC_TODAY)' : ''}`);
   const browser = await chromium.launch({ headless: true });
   try {
     await functional(browser);
     await bigGallery(browser);
+    await urlSafety(browser);
     await dst(browser);
   } finally {
     await browser.close();
