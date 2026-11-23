@@ -200,20 +200,17 @@
   let _distinctTags = null;
   async function distinctTags() {
     if (_distinctTags) return _distinctTags;
+    // One getAll() round-trip, tags collected in memory: a key cursor on the
+    // multiEntry 'tags' index fires one event per (tag, like) pair (trap #4).
+    // (index.getAllKeys() would return primary keys, not the tags.)
     const db = await openDB();
     const tx = db.transaction(STORE_POSTS, 'readonly');
-    const idx = tx.objectStore(STORE_POSTS).index('tags');
+    const all = await reqDone(tx.objectStore(STORE_POSTS).getAll());
     const set = new Set();
-    await new Promise((resolve, reject) => {
-      const cur = idx.openKeyCursor();
-      cur.onsuccess = () => {
-        const c = cur.result;
-        if (!c) { resolve(); return; }
-        set.add(c.key);
-        c.continue();
-      };
-      cur.onerror = () => reject(cur.error);
-    });
+    for (const r of all) {
+      if (!r || !Array.isArray(r.tags)) continue;
+      for (const t of r.tags) if (typeof t === 'string' && t) set.add(t);
+    }
     _distinctTags = Array.from(set).sort();
     return _distinctTags;
   }
