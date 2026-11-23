@@ -242,6 +242,40 @@ async function bigGallery(browser) {
   });
   ok(suggested && s.chips.length === 20, `C: 20 tag suggestions for "t" (got ${s.chips.length}: ${JSON.stringify(s.chips.slice(0, 3))}…)`);
   ok(s.steps === 0, `C: no row-by-row IDBCursor.continue() in tag suggestions (got ${s.steps})`);
+
+  // Same for the "Followed blogs" tab: seed its store directly (the API stub
+  // can't drive a followed-blogs scan), then search a tag with no exact match.
+  const FN = 5000;
+  await page.evaluate((FN) => new Promise((resolve, reject) => {
+    const rq = indexedDB.open('TumblrLikesCalendar');
+    rq.onerror = () => reject(rq.error);
+    rq.onsuccess = () => {
+      const tx = rq.result.transaction('followed', 'readwrite');
+      const st = tx.objectStore('followed');
+      for (let i = 0; i < FN; i++) {
+        const blog = 'fb' + (i % 25), tags = ['f' + (i % 15), 'shared'];
+        st.put({ key: blog + ':' + (50000 + i), id: String(50000 + i), blog, ts: 1700000000 - i * 600, tags, tagsRaw: tags,
+          images: [`https://img.example/f${i}.jpg`], postUrl: `https://${blog}.tumblr.com/post/${50000 + i}` });
+      }
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    };
+  }), FN);
+  await page.click('button:has-text("Followed blogs")');
+  await page.evaluate(() => { window.__tlcCursorSteps = 0; });
+  await page.fill('input[placeholder^="Search downloaded posts"]', 'f');
+  await page.press('input[placeholder^="Search downloaded posts"]', 'Enter');
+  let fSuggested = true;
+  try {
+    await page.waitForFunction(() => [...document.querySelectorAll('#tlc-panel .tlc-suggest')].some((e) => e.offsetParent), null, { timeout: 15000 });
+  } catch { fSuggested = false; }
+  const fs2 = await page.evaluate(() => {
+    const sug = [...document.querySelectorAll('#tlc-panel .tlc-suggest')].find((e) => e.offsetParent);
+    const chips = sug && sug.nextElementSibling ? [...sug.nextElementSibling.querySelectorAll('.tlc-chip')].map((c) => c.textContent) : [];
+    return { steps: window.__tlcCursorSteps, chips };
+  });
+  ok(fSuggested && fs2.chips.length === 15, `C: 15 followed-tag suggestions for "f" (got ${fs2.chips.length}: ${JSON.stringify(fs2.chips.slice(0, 3))}…)`);
+  ok(fs2.steps === 0, `C: no row-by-row IDBCursor.continue() in followed-tag suggestions (got ${fs2.steps})`);
   ok(errs.length === 0, 'C: no page errors (' + JSON.stringify(errs.slice(0, 2)) + ')');
   await ctx.close();
 }

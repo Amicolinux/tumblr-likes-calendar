@@ -247,20 +247,15 @@
   let _distinctFollowedTags = null;
   async function distinctFollowedTags() {
     if (_distinctFollowedTags) return _distinctFollowedTags;
+    // Same as distinctTags(): one getAll() + in-memory Set, no key cursor (trap #4).
     const db = await openDB();
     const tx = db.transaction(STORE_FOLLOWED, 'readonly');
-    const idx = tx.objectStore(STORE_FOLLOWED).index('tags');
+    const all = await reqDone(tx.objectStore(STORE_FOLLOWED).getAll());
     const set = new Set();
-    await new Promise((resolve, reject) => {
-      const cur = idx.openKeyCursor();
-      cur.onsuccess = () => {
-        const c = cur.result;
-        if (!c) { resolve(); return; }
-        set.add(c.key);
-        c.continue();
-      };
-      cur.onerror = () => reject(cur.error);
-    });
+    for (const r of all) {
+      if (!r || !Array.isArray(r.tags)) continue;
+      for (const t of r.tags) if (typeof t === 'string' && t) set.add(t);
+    }
     _distinctFollowedTags = Array.from(set).sort();
     return _distinctFollowedTags;
   }
