@@ -80,10 +80,13 @@ si leggono nel codice; tutti paginano con `response.links.next.href`.
    `weekday === (dayOfYear + startDay) % 7`.
 2. **Bucket per giorno LOCALE.** `dayKey` e `postsByDay` usano la data locale.
    Heatmap, conteggi e vista-giorno devono restare coerenti sullo stesso fuso.
-3. **Non "saltare a una data" via URL Tumblr.** `/likes?before=<ts>` non si fissa
-   su un giorno (Tumblr impagina dal più recente in giù → arrivi a un giorno
-   successivo). Il clic sul giorno mostra i like **nel pannello** (da IndexedDB).
-   Non tornare a `location.assign('/likes?before=')`.
+3. **Non "saltare a una data" via URL Tumblr.** Né `/likes?before=<ts>` né
+   `/likes?after=<ts>` si fissano su un giorno: Tumblr impagina dal più recente
+   in giù e, finito il caricamento, la sua app reimpagina → arrivi a un giorno
+   successivo (collaudo 0.4.1: `?after=` del 19 ott → mostrato il 24 ott). Il
+   clic sul giorno mostra i like **nel pannello** (da IndexedDB). Niente
+   `location.assign`/`location.href`/`window.open` né link `<a>` verso
+   `/likes?before=` o `/likes?after=` (lo verifica `tests/e2e.cjs`).
 4. **~11k like: niente cursori riga-per-riga.** `openCursor`/`openKeyCursor` con
    `continue()` sparano decine di migliaia di eventi e **congelano il tab**. Usa
    **`getAll()` / `getAllKeys()`** (un round-trip) e itera in memoria.

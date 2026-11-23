@@ -186,23 +186,15 @@
   }
 
   // Newest-first liked posts that have at least one image, up to `limit`.
+  // One getAll() round-trip + in-memory filter/sort: a row-by-row cursor fires
+  // one event per like and freezes the tab with ~11k likes (CLAUDE.md trap #4).
   async function likesWithImages(limit) {
     const db = await openDB();
     const tx = db.transaction(STORE_POSTS, 'readonly');
-    const idx = tx.objectStore(STORE_POSTS).index('ts');
-    const out = [];
-    await new Promise((resolve, reject) => {
-      const cur = idx.openCursor(null, 'prev'); // newest first
-      cur.onsuccess = () => {
-        const c = cur.result;
-        if (!c || out.length >= limit) { resolve(); return; }
-        const r = c.value;
-        if (r && r.images && r.images.length) out.push(r);
-        c.continue();
-      };
-      cur.onerror = () => reject(cur.error);
-    });
-    return out;
+    const all = await reqDone(tx.objectStore(STORE_POSTS).getAll());
+    const out = all.filter((r) => r && r.images && r.images.length);
+    out.sort((a, b) => (b.ts || 0) - (a.ts || 0));
+    return Number.isFinite(limit) ? out.slice(0, Math.max(0, limit)) : out;
   }
 
   let _distinctTags = null;
@@ -1083,8 +1075,10 @@
   }
 
   // Show the likes of one LOCAL day inside the panel. Reliable to the day,
-  // unlike linking to Tumblr's /likes page (which paginates newest-first and
-  // can't be pinned to an exact date).
+  // unlike linking to Tumblr's /likes page: neither ?before= nor ?after= can be
+  // pinned to an exact date (Tumblr paginates newest-first and its app re-pages
+  // after load, landing on a later day). So there is deliberately NO
+  // "open this day on Tumblr" link — each result links to its own post instead.
   async function doDaySearch(key) {
     showingSearch = true;
     searchInput.value = '';
@@ -1127,18 +1121,6 @@
     header.textContent = matches.length
       ? `${matches.length} like${matches.length === 1 ? '' : 's'} on ${pretty}`
       : `No likes on ${pretty}.`;
-
-    // Keep a way to open that day on Tumblr too (approximate, newest-first).
-    const dayEnd = dm ? Math.floor(new Date(+dm[1], +dm[2] - 1, +dm[3] + 1).getTime() / 1000) : null;
-    if (dayEnd) {
-      const open = document.createElement('a');
-      open.className = 'tlc-btn';
-      open.style.marginLeft = '10px';
-      open.textContent = 'Open on Tumblr ↗';
-      open.href = '/likes?before=' + dayEnd;
-      open.title = 'Opens Tumblr around this day (Tumblr shows likes newest-first, so it may not land exactly).';
-      bar.appendChild(open);
-    }
 
     if (!matches.length) return;
 

@@ -41,19 +41,20 @@ async function newCtx(browser, tz) {
   return ctx;
 }
 
-async function scan(page, posts) {
+// `pageSize` lets big datasets scan in few pages (the extension sleeps between pages).
+async function scan(page, posts, pageSize = PAGE) {
   await page.addInitScript(({ posts, PAGE }) => {
     window.tumblr = { apiFetch: async (res) => {
       const m = /offset=(\d+)/.exec(res); const o = m ? +m[1] : 0;
       const s = posts.slice(o, o + PAGE); const n = o + PAGE;
       return { response: { likedPosts: s, links: n < posts.length ? { next: { href: `/v2/user/likes?limit=${PAGE}&offset=${n}` } } : undefined } };
     } };
-  }, { posts, PAGE });
+  }, { posts, PAGE: pageSize });
   await page.goto('https://www.tumblr.com/likes');
   await page.addScriptTag({ content: JS });
   await page.click('#tlc-launcher');
   await page.click('button:has-text("Refresh likes")');
-  await page.waitForFunction(() => { const s = document.querySelector('#tlc-panel .tlc-sub'); return s && /likes total/.test(s.textContent); }, { timeout: 20000 });
+  await page.waitForFunction(() => { const s = document.querySelector('#tlc-panel .tlc-sub'); return s && /likes total/.test(s.textContent); }, { timeout: 60000 });
 }
 
 // ---- A) functional ----------------------------------------------------------
@@ -102,6 +103,12 @@ async function functional(browser) {
   ok(day.dates.length === 3, `A: 3 results for ${T1_LABEL} (got ${day.dates.length})`);
   ok(day.dates.every((d) => d === T1_LABEL), `A: every result is ${T1_LABEL} (got ${JSON.stringify(day.dates)})`);
   ok(navigated === null, `A: no Tumblr navigation on day click (${navigated})`);
+  // Trap #3: the day view must not offer any "go to date" path towards Tumblr's
+  // /likes page — neither ?before= nor ?after= (Tumblr paginates newest-first
+  // and its app re-pages after load, so it lands on a later day).
+  const dateLinks = await page.evaluate(() => [...document.querySelectorAll('#tlc-panel a[href]')]
+    .map((a) => a.getAttribute('href')).filter((h) => /\/likes\?(?:[^#]*&)?(?:before|after)=/i.test(h)));
+  ok(dateLinks.length === 0, `A: day view has no /likes?before|after= link (got ${JSON.stringify(dateLinks)})`);
 
   // --- gallery virtualization ---
   await page.evaluate(() => { const b = [...document.querySelectorAll('#tlc-panel .tlc-back')][0]; if (b) b.click(); });
@@ -175,11 +182,57 @@ async function dst(browser) {
   }
 }
 
+// ---- C) big library: gallery opens fast, no row-by-row cursor (trap #4) -----
+async function bigGallery(browser) {
+  const N = 15000;
+  const base = Math.floor(NOW.getTime() / 1000) - 3600;
+  const posts = [];
+  for (let i = 0; i < N; i++) {
+    const p = post(20000 + i, base - i * 1800, 'big' + (i % 50), ['t' + (i % 20)]);
+    if (i % 10 === 9) { p.content = [{ type: 'text', text: 'no image' }]; } // 10% text-only
+    posts.push(p);
+  }
+  const withImg = N - N / 10;
+  const ctx = await newCtx(browser, 'Europe/Rome');
+  const page = await ctx.newPage();
+  const errs = [];
+  page.on('pageerror', (e) => errs.push(String(e)));
+  await scan(page, posts, 1000);
+
+  // Count row-by-row cursor steps triggered by opening the gallery.
+  await page.evaluate(() => {
+    window.__tlcCursorSteps = 0;
+    const orig = IDBCursor.prototype.continue;
+    IDBCursor.prototype.continue = function (...a) { window.__tlcCursorSteps++; return orig.apply(this, a); };
+  });
+  const t0 = Date.now();
+  await page.click('button:has-text("Gallery")');
+  let opened = true;
+  try {
+    await page.waitForFunction((n) => new RegExp('^' + n + ' liked images').test(document.getElementById('tlc-gallery-note').textContent)
+      && document.querySelectorAll('.tlc-gi-abs').length > 0, withImg, { timeout: 15000 });
+  } catch { opened = false; }
+  const ms = Date.now() - t0;
+  const r = await page.evaluate(() => {
+    const cells = [...document.querySelectorAll('.tlc-gi-abs')].sort((a, b) => parseFloat(a.style.top) - parseFloat(b.style.top) || parseFloat(a.style.left) - parseFloat(b.style.left));
+    const first = cells[0] && cells[0].querySelector('img');
+    return { steps: window.__tlcCursorSteps, note: document.getElementById('tlc-gallery-note').textContent, firstImg: first ? first.getAttribute('src') : null, cells: cells.length };
+  });
+  ok(opened, `C: gallery shows all ${withImg} image likes of ${N} (note "${r.note}")`);
+  ok(ms < 3000, `C: gallery opened in ${ms} ms (< 3000)`);
+  ok(r.steps === 0, `C: no row-by-row IDBCursor.continue() on gallery open (got ${r.steps})`);
+  ok(r.firstImg === 'https://img.example/20000.jpg', `C: newest like first (got ${r.firstImg})`);
+  ok(r.cells > 0 && r.cells < 300, `C: DOM bounded with ${N} likes (got ${r.cells})`);
+  ok(errs.length === 0, 'C: no page errors (' + JSON.stringify(errs.slice(0, 2)) + ')');
+  await ctx.close();
+}
+
 (async () => {
   console.log(`Simulated today: ${NOW.toISOString().slice(0, 10)}${process.env.TLC_TODAY ? ' (TLC_TODAY)' : ''}`);
   const browser = await chromium.launch({ headless: true });
   try {
     await functional(browser);
+    await bigGallery(browser);
     await dst(browser);
   } finally {
     await browser.close();
