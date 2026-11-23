@@ -19,11 +19,11 @@ rm -rf dist && mkdir -p dist
 zip -qr -X dist/firefox.zip manifest.json likes-calendar.js icons
 
 # --- Chrome: manifest without browser_specific_settings ---
-mkdir -p "$TMP/chrome/icons"
+mkdir -p "$TMP/chrome"
 node -e "const m=require('./manifest.json'); delete m.browser_specific_settings; \
   require('fs').writeFileSync('$TMP/chrome/manifest.json', JSON.stringify(m,null,2)+'\n');"
 cp likes-calendar.js "$TMP/chrome/"
-cp icons/*.png "$TMP/chrome/icons/"
+cp -R icons "$TMP/chrome/"
 ( cd "$TMP/chrome" && zip -qr -X - manifest.json likes-calendar.js icons ) > dist/chrome.zip
 
 echo "Built v$VERSION -> dist/firefox.zip , dist/chrome.zip"

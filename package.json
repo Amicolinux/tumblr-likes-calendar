@@ -1,13 +1,13 @@
 {
-  "name": "repo",
-  "version": "1.0.0",
+  "name": "tumblr-likes-calendar",
+  "private": true,
   "description": "Tumblr Likes Calendar",
   "main": "likes-calendar.js",
   "directories": {
     "test": "tests"
   },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node tests/e2e.cjs"
   },
   "repository": {
     "type": "git",
@@ -15,15 +15,12 @@
   },
   "keywords": [],
   "author": "",
-  "license": "ISC",
+  "license": "GPL-3.0-only",
   "bugs": {
     "url": "https://github.com/Amicolinux/tumblr-likes-calendar/issues"
   },
   "homepage": "https://github.com/Amicolinux/tumblr-likes-calendar#readme",
   "devDependencies": {
     "playwright": "^1.65.1"
-  },
-  "dependencies": {
-    "playwright-core": "^1.65.1"
   }
 }
