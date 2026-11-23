@@ -120,15 +120,23 @@ si leggono nel codice; tutti paginano con `response.links.next.href`.
 
 ```
 npm i -D playwright && npx playwright install chromium   # una tantum
-node tests/e2e.cjs
+npm test                                   # = node tests/e2e.cjs
+TLC_TODAY=2027-01-10 npm test              # simula un altro "oggi"
 ```
 
-Inietta il file nel world MAIN, stubba `window.tumblr.apiFetch` e la pagina
-`/likes`. Copre: clic sul giorno (solo i like di quel giorno, nessuna navigazione),
-galleria virtualizzata (DOM limitato + riciclo allo scroll), filtri tag e
-`blog:nome`, e l'assenza di collisioni di celle su `Europe/Rome`,
-`America/New_York`, `Asia/Tokyo` (regressione DST). Per aggiungere casi, estendi
-`tests/e2e.cjs`. Sintassi veloce: `node --check likes-calendar.js`.
+Inietta il file nel world MAIN, stubba `window.tumblr.apiFetch` (like, e
+opzionalmente following + post dei blog) e la pagina `/likes`. Gruppi:
+
+- **A** clic sul giorno (solo quel giorno, nessuna navigazione), galleria virtualizzata, filtri tag/`blog:`.
+- **B** nessuna collisione di celle su Rome/New_York/Tokyo (DST).
+- **C** 15k like: galleria e suggerimenti tag senza `IDBCursor.continue` (trappola #4).
+- **D** URL `javascript:`/`data:` mai in `href`/`src`, `//host` accettati, nomi blog non validi senza link (trappola #5).
+- **E** ricerche rapide in sequenza (giorno/blog/tag, scheda seguiti, Count posts): solo l'ultima mostra risultati.
+- **F** filtri galleria rapidi in sequenza: nota e griglia del filtro più recente.
+- **G** pulsanti Heatmap/Gallery, `blog:` senza nome, clic su tag mostrato.
+
+Helper: `installSlowGetAll(page)` rende lenta la prossima `getAll()` (gare
+deterministiche); `TLC_TODAY` fissa la data. Sintassi: `node --check likes-calendar.js`.
 
 ## Versioni / roadmap
 

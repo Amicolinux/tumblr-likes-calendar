@@ -15,6 +15,14 @@
  *     caption to filter to that blog.
  *   - A year/month jump rail on the right lets you leap straight to any period
  *     instead of scrolling for ages.
+ *   - The gallery and tag suggestions open much faster with many likes.
+ *   - Fixed mixed-up results when clicking days, blogs, tags or gallery
+ *     filters quickly one after another.
+ *   - Safer links: suspicious post or image addresses are never turned into
+ *     clickable links.
+ *   - Clicking a tag on a result now always searches that exact tag.
+ *   - Typing just "blog:" now tells you to add a blog name.
+ *   - The Heatmap/Gallery buttons always show which view is active.
  *
  * What's new in 0.4.0:
  *   - Gallery view of your likes: a "Gallery" toggle on the Calendar tab shows
