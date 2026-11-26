@@ -1,0 +1,26 @@
+{
+  "name": "tumblr-likes-calendar",
+  "private": true,
+  "description": "Tumblr Likes Calendar",
+  "main": "likes-calendar.js",
+  "directories": {
+    "test": "tests"
+  },
+  "scripts": {
+    "test": "node tests/e2e.cjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Amicolinux/tumblr-likes-calendar.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "GPL-3.0-only",
+  "bugs": {
+    "url": "https://github.com/Amicolinux/tumblr-likes-calendar/issues"
+  },
+  "homepage": "https://github.com/Amicolinux/tumblr-likes-calendar#readme",
+  "devDependencies": {
+    "playwright": "^1.65.1"
+  }
+}

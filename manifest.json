@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Tumblr Likes Calendar",
-  "version": "0.3.0",
+  "version": "0.4.1",
   "description": "Heatmap calendar of your Tumblr likes with tag search, plus the image posts of blogs you follow, searchable by tag.",
   "browser_specific_settings": {
     "gecko": {
